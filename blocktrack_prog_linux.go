@@ -10,7 +10,7 @@
 // the agent, including the runtime that loads this program, is proprietary
 // and is not covered by this notice
 //
-//go:build linux && amd64
+//go:build linux && (amd64 || arm64)
 
 package replication
 

@@ -13,9 +13,17 @@ agent falls back to a full read. It reads the request structure directly, with
 field offsets taken from the running kernel's BTF, so it needs no kernel
 headers, no compiler on the host and no per-kernel build.
 
+`blocktrack_mark_prog_linux.go` holds the mark-mode programs the agent uses
+while a cloud disk is replicated from snapshots. One program on
+`block_rq_issue` counts each write-class request's regions and records it as
+in flight; one on `block_rq_complete` removes it once it has completed in full.
+A request the programs cannot account for (a driver passthrough that may
+change data, a full map, a bio chain past its walk limit) moves a witness
+counter, and the agent then reads the whole disk.
+
 ## Licence
 
-`blocktrack_prog_linux.go` is offered under either the BSD 2-Clause licence
+`blocktrack_prog_linux.go` and `blocktrack_mark_prog_linux.go` are offered under either the BSD 2-Clause licence
 (`LICENSE-BSD`) or the GNU General Public License version 2 (`LICENSE-GPL`),
 at your option. The kernel requires a GPL-compatible licence for a BPF program
 that reads kernel structures, and the program declares itself to the kernel as
@@ -27,8 +35,8 @@ covered by these licences.
 
 ## Layout
 
-The file is a verbatim copy of `agent/replication/blocktrack_prog_linux.go`
-in the CloudHound agent. It is written against Go 1.19 and depends only on the
+Each file is a verbatim copy of the file of the same name under
+`agent/replication/` in the CloudHound agent. They are written against Go 1.19 and depend only on the
 standard library. `buildTrackProgram` takes the struct offsets and operation
 codes the agent resolved from the kernel's BTF, the disk's device number, the
 region size and the two map file descriptors, and returns the instructions.
