@@ -34,7 +34,7 @@ const (
 
 
 // stats map slots
-const statOverflow = 0 // requests wider than the unrolled loop
+const statOverflow = 0 // requests the program cannot mark: wider than the unrolled loop, a merged discard, a passthrough
 
 // btfField is a struct member located for a load: byte offset and size
 type btfField struct {
@@ -219,13 +219,17 @@ type trackLayout struct {
 	segments    btfField // struct request .nr_phys_segments (u16); the range count of a merged discard
 	bio         btfField // struct request .bio (pointer): the first bio still to complete
 	bioSector   btfField // struct bio .bi_iter.bi_sector (u64): where that bio really starts
-	rqDisk      btfField // struct request .rq_disk (pointer) on kernels before 5.15, else unset
 	q           btfField // struct request .q (pointer)
-	qDisk       btfField // struct request_queue .disk (pointer) from 5.15
+	qDisk       btfField // struct request_queue .disk (pointer) from 5.15, else unset
+	qBDI        btfField // struct request_queue .backing_dev_info (pointer), used only without qDisk
+	bdiOwner    btfField // struct backing_dev_info .owner (pointer): the disk's struct device
+	devT        btfField // struct device .devt (u32)
 	major       btfField // struct gendisk .major (int)
 	firstMinor  btfField // struct gendisk .first_minor (int)
 	writeOps    []int32  // REQ_OP_* values that change data
 	discardOps  []int32  // the subset the block layer may merge from separate ranges
+	readOps     []int32  // REQ_OP_* values that never change data
+	dataInOps   []int32  // driver passthrough that moves data from the device (DRV_IN, SCSI_IN)
 }
 
 // the operation codes that change what is on the disk. write-same is gone
@@ -236,6 +240,19 @@ type trackLayout struct {
 var trackWriteOpNames = []string{"REQ_OP_WRITE", "REQ_OP_DISCARD", "REQ_OP_SECURE_ERASE", "REQ_OP_WRITE_SAME", "REQ_OP_WRITE_ZEROES"}
 
 var trackDiscardOpNames = map[string]bool{"REQ_OP_DISCARD": true, "REQ_OP_SECURE_ERASE": true}
+
+// every other operation on the disk (driver passthrough sent through sg, bsg,
+// SG_IO or the nvme ioctls, zone management, any code a newer kernel adds)
+// can change data at places the program cannot see, so it is counted as
+// overflow and the next pass reads in full. reads and flushes never change
+// data. a passthrough that moved data from the device is a query (INQUIRY,
+// the agent's own PERSISTENT RESERVE IN on every pass, smart and log pages)
+// and is let through; one that moved nothing may be FORMAT UNIT, SANITIZE,
+// WRITE SAME with no data-out buffer or an nvme write zeroes, so it counts.
+// the older kernels name the scsi forms of the same operations
+var trackReadOpNames = []string{"REQ_OP_READ", "REQ_OP_FLUSH"}
+
+var trackDataInOpNames = []string{"REQ_OP_DRV_IN", "REQ_OP_SCSI_IN"}
 
 // the operation lives in the low byte of cmd_flags (REQ_OP_BITS is 8)
 const reqOpMask = 0xff
@@ -254,19 +271,23 @@ func loadOff(f btfField) (int16, error) {
 // the completed byte count. loads through the request pointer are typed by
 // the verifier from btf and fault-safe (a null pointer reads as zero, which
 // never matches the disk). register use: r6 = ctx, r2 = request, r3 =
-// operation, r7 = position then first region, r8 = last region; r7 and r8
-// survive the helper calls. the immediate compared against dev is
-// sign-extended by the 64-bit jump, so the caller guarantees dev has bit 31
-// clear. nothing is counted, for any disk, before the device match
+// operation, r9 = the disk, r7 = position then first region, r8 = last
+// region; r7 and r8 survive the helper calls. the immediate compared against
+// dev is sign-extended by the 64-bit jump, so the caller guarantees dev has
+// bit 31 clear. nothing is counted, for any disk, before the device match, and a
+// read leaves before it
 func buildTrackProgram(l trackLayout, dev uint32, shift uint, regionMapFD, statsMapFD int) ([]bpfInsn, error) {
 	if dev >= 1<<31 {
 		return nil, fmt.Errorf("device number %#x cannot be compared by the program", dev)
 	}
-	if len(l.writeOps) == 0 {
-		return nil, fmt.Errorf("no write operation codes")
+	if len(l.writeOps) == 0 || len(l.readOps) == 0 {
+		return nil, fmt.Errorf("operation codes missing")
+	}
+	if l.qDisk.size == 0 && (l.qBDI.size == 0 || l.bdiOwner.size == 0 || l.devT.size == 0) {
+		return nil, fmt.Errorf("no way to find a request queue's disk")
 	}
 	offs := map[string]int16{}
-	for name, f := range map[string]btfField{"sector": l.sector, "cmd_flags": l.cmdFlags, "segments": l.segments, "bio": l.bio, "bio_sector": l.bioSector, "rq_disk": l.rqDisk, "q": l.q, "q_disk": l.qDisk, "major": l.major, "first_minor": l.firstMinor} {
+	for name, f := range map[string]btfField{"sector": l.sector, "cmd_flags": l.cmdFlags, "segments": l.segments, "bio": l.bio, "bio_sector": l.bioSector, "q": l.q, "q_disk": l.qDisk, "q_bdi": l.qBDI, "bdi_owner": l.bdiOwner, "devt": l.devT, "major": l.major, "first_minor": l.firstMinor} {
 		o, err := loadOff(f)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
@@ -279,27 +300,54 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regionMapFD, stats
 	a.emit(ldx(bpfSizeDW, r7, r2, offs["sector"]))      // r7 = rq->__sector
 	a.emit(ldx(bpfSizeW, r3, r2, offs["cmd_flags"]))    // r3 = rq->cmd_flags
 	a.emit(andImm(r3, reqOpMask))                      // r3 = op
+	for _, op := range l.readOps {
+		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "exit")
+	}
+
+	// the disk is the one the request's queue belongs to, never the disk the
+	// request names: before 5.16 sg and bsg send a passthrough to this disk's
+	// queue naming the sg node's disk or none. from 5.15 that is the queue's
+	// gendisk, before it the device that owns the queue's backing_dev_info,
+	// whose devt is the disk's. anything on another disk leaves here. a queue
+	// with no disk is a controller's own: an nvme format or sanitize of this
+	// disk runs on the admin queue, so passthrough there is judged as if it
+	// were on this disk
+	a.emit(ldx(bpfSizeDW, r9, r2, offs["q"]))
+	if l.qDisk.size != 0 {
+		a.emit(ldx(bpfSizeDW, r9, r9, offs["q_disk"]))
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		a.emit(ldx(bpfSizeW, r0, r9, offs["major"]))
+		a.emit(lshImm(r0, 20))
+		a.emit(ldx(bpfSizeW, r1, r9, offs["first_minor"]))
+		a.emit(orReg(r0, r1))
+	} else {
+		a.emit(ldx(bpfSizeDW, r9, r9, offs["q_bdi"]))
+		a.emit(ldx(bpfSizeDW, r9, r9, offs["bdi_owner"]))
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		a.emit(ldx(bpfSizeW, r0, r9, offs["devt"]))
+	}
+	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), "exit")
 	for _, op := range l.writeOps {
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "write")
 	}
-	a.jump(bpfJA, 0, 0, 0, "exit")
+	a.label("passthrough")
+	for _, op := range l.dataInOps {
+		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "datain")
+	}
+	a.jump(bpfJA, 0, 0, 0, "overflow")
+	// the verifier refuses unreachable code, so the block exists only when a
+	// data-in code jumps to it. nr_bytes is the length of the buffer the issuer
+	// declared, zero for a command with no data phase
+	if len(l.dataInOps) > 0 {
+		a.label("datain")
+		a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
+		a.jump(bpfJEQ|bpfSrcK, r4, 0, 0, "overflow")
+		a.jump(bpfJA, 0, 0, 0, "exit")
+	}
 
 	a.label("write")
 	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
 	a.jump(bpfJEQ|bpfSrcK, r4, 0, 0, "exit")
-
-	// r9 = the request's disk; anything on another disk leaves here
-	if l.rqDisk.size != 0 {
-		a.emit(ldx(bpfSizeDW, r9, r2, offs["rq_disk"]))
-	} else {
-		a.emit(ldx(bpfSizeDW, r9, r2, offs["q"]))
-		a.emit(ldx(bpfSizeDW, r9, r9, offs["q_disk"]))
-	}
-	a.emit(ldx(bpfSizeW, r0, r9, offs["major"]))
-	a.emit(lshImm(r0, 20))
-	a.emit(ldx(bpfSizeW, r1, r9, offs["first_minor"]))
-	a.emit(orReg(r0, r1))
-	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), "exit")
 
 	// a discard merged from several ranges cannot be marked from its first
 	// range and total length, and once part of it has completed the request's
