@@ -63,8 +63,6 @@ type markLayout struct {
 	tag           btfField // struct request .tag (int): the driver tag
 	mqHctx        btfField // struct request .mq_hctx (pointer)
 	queueNum      btfField // struct blk_mq_hw_ctx .queue_num (u32)
-	bioNext       btfField // struct bio .bi_next (pointer)
-	bioSize       btfField // struct bio .bi_iter.bi_size (u32)
 	readOps       []int32  // operations that never change data
 	plainOps      []int32  // write-class operations with one contiguous range
 	rangeOps      []int32  // discard-class operations whose ranges come from the bios
