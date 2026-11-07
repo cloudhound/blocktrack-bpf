@@ -267,7 +267,21 @@ type trackLayout struct {
 	discardOps  []int32  // the subset the block layer may merge from separate ranges, marked from their bios
 	readOps     []int32  // REQ_OP_* values that never change data
 	dataInOps   []int32  // driver passthrough that moves data from the device (DRV_IN, SCSI_IN)
+	scsi        scsiPassLayout
 }
+
+// where a scsi request's command bytes are, for letting the known-harmless
+// commands that move no data through (scsiPassFor). the zero value turns the
+// check off, and a disk that is not an sd disk on blk-mq always has it off
+type scsiPassLayout struct {
+	probeRead int32    // helper id of bpf_probe_read_kernel
+	pdu       uint32   // sizeof(struct request): blk-mq puts the driver's per-request data (struct scsi_cmnd on an sd queue) right after it
+	cmdLen    btfField // struct scsi_cmnd .cmd_len (u16)
+	cmnd      btfField // struct scsi_cmnd .cmnd
+	inline    bool     // cmnd holds the bytes (an array, from about 5.18), else it points to them
+}
+
+func (s scsiPassLayout) usable() bool { return s.probeRead != 0 }
 
 // the operation codes that change what is on the disk. write-same is gone
 // from newer kernels and simply absent there; zone append is refused at
@@ -290,6 +304,30 @@ var trackDiscardOpNames = map[string]bool{"REQ_OP_DISCARD": true, "REQ_OP_SECURE
 var trackReadOpNames = []string{"REQ_OP_READ", "REQ_OP_FLUSH"}
 
 var trackDataInOpNames = []string{"REQ_OP_DRV_IN", "REQ_OP_SCSI_IN"}
+
+// the zero-data commands let through on an sd disk, matched exactly on their
+// command bytes: TEST UNIT READY (udev's re-probe, the kernel's own media
+// check, smartd on scsi and sas), and ATA PASS-THROUGH with the non-data
+// protocol carrying SMART RETURN STATUS or CHECK POWER MODE (smartd on sata).
+// none of them can change the media. every other command with no data phase
+// still counts, and so does any read of the command that fails
+const (
+	scsiTestUnitReady = 0x00
+	scsiATAPass16     = 0x85
+	scsiATAPass12     = 0xa1
+	ataProtoMask      = 0x1e // byte 1 bits 4:1
+	ataProtoNonData   = 0x06 // protocol 3
+	ataSMART          = 0xb0
+	ataSMARTStatus    = 0xda // the SMART feature RETURN STATUS
+	ataCheckPower     = 0xe5
+)
+
+// stack slots for the command check, below every other slot the program uses
+const (
+	scsiCmdLenSlot = -8  // cmd_len, 2 bytes
+	scsiPtrSlot    = -16 // the cmnd pointer on kernels where it is one
+	scsiCDBSlot    = -32 // the first 16 command bytes
+)
 
 // the operation lives in the low byte of cmd_flags (REQ_OP_BITS is 8)
 const reqOpMask = 0xff
@@ -329,9 +367,11 @@ func trackLevels(regions uint32) (bases []uint32, cells uint32) {
 // the verifier from btf and fault-safe (a null pointer reads as zero, which
 // never matches the disk). register use: r6 = ctx, r2 = request, r3 =
 // operation, r9 = the disk then a discard's bio, r7 = start sector then
-// first region, r8 = end sector then last region; r7, r8 and r9 survive the
-// helper calls. the immediate compared against dev is sign-extended by the
-// 64-bit jump, so the caller guarantees dev has bit 31 clear. nothing is
+// first region, r8 = end sector then last region, and in the scsi command
+// check r7 = the scsi_cmnd, r8 = the cdb pointer then cmd_len, r9 = a cdb
+// byte; r7, r8 and r9 survive the helper calls. the immediate compared
+// against dev is sign-extended by the 64-bit jump, so the caller guarantees
+// dev has bit 31 clear. nothing is
 // counted, for any disk, before the device match, and a read leaves before it
 func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, regionMapFD, statsMapFD int) ([]bpfInsn, error) {
 	if dev >= 1<<31 {
@@ -397,6 +437,16 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 	for _, op := range l.writeOps {
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "write")
 	}
+	// passthrough on the disk's own queue, whose per-request data is the
+	// disk driver's: an sd disk's zero-data commands are checked against the
+	// list. the request is reloaded from the context because r1-r3 become
+	// the probe read's arguments
+	if l.scsi.usable() && len(l.dataInOps) > 0 {
+		for _, op := range l.dataInOps {
+			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "scsidatain")
+		}
+		a.jump(bpfJA, 0, 0, 0, "overflow")
+	}
 	a.label("passthrough")
 	for _, op := range l.dataInOps {
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "datain")
@@ -410,6 +460,9 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 		a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
 		a.jump(bpfJEQ|bpfSrcK, r4, 0, 0, "overflow")
 		a.jump(bpfJA, 0, 0, 0, "exit")
+		if l.scsi.usable() {
+			emitSCSIPass(a, l.scsi)
+		}
 	}
 
 	a.label("write")
@@ -513,8 +566,70 @@ func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32,
 	emitTrackOverflow(a, "fold", statsMapFD)
 }
 
-// emitTrackOverflow counts a completion that could not be placed and ends
-// the program, at labels p+"overflow" and p+"exit"
+// the scsidatain block: a data-in passthrough on an sd
+// disk's own queue. one that moved data leaves as datain does; one that moved
+// none leaves only when its command is on the list, read from the request's
+// struct scsi_cmnd with bpf_probe_read_kernel, since the verifier bounds btf
+// loads to struct request. a failed read zero-fills its buffer and zero is
+// TEST UNIT READY's opcode, so every read's result is checked and the length
+// must match the command exactly. clobbers r0-r5 and r7-r9
+func emitSCSIPass(a *bpfAsm, s scsiPassLayout) {
+	a.label("scsidatain")
+	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
+	a.jump(bpfJNE|bpfSrcK, r4, 0, 0, "exit")
+	a.emit(ldx(bpfSizeDW, r7, r6, 0)) // r7 = rq
+	a.emit(addImm(r7, int32(s.pdu)))  // r7 = the struct scsi_cmnd after it
+	read := func(slot int16, size int32, src uint8, off int32) {
+		a.emit(movReg(r1, r10))
+		a.emit(addImm(r1, int32(slot)))
+		a.emit(movImm(r2, size))
+		a.emit(movReg(r3, src))
+		a.emit(addImm(r3, off))
+		a.emit(callHelper(s.probeRead))
+		a.jump(bpfJNE|bpfSrcK, r0, 0, 0, "overflow")
+	}
+	read(scsiCmdLenSlot, 2, r7, int32(s.cmdLen.off))
+	if s.inline {
+		read(scsiCDBSlot, 16, r7, int32(s.cmnd.off))
+	} else {
+		read(scsiPtrSlot, 8, r7, int32(s.cmnd.off))
+		a.emit(ldx(bpfSizeDW, r8, r10, scsiPtrSlot))
+		a.jump(bpfJEQ|bpfSrcK, r8, 0, 0, "overflow")
+		read(scsiCDBSlot, 16, r8, 0)
+	}
+	a.emit(ldx(bpfSizeH, r8, r10, scsiCmdLenSlot)) // r8 = cmd_len
+	cdb := func(dst uint8, i int16) { a.emit(ldx(bpfSizeB, dst, r10, scsiCDBSlot+i)) }
+	cdb(r9, 0) // r9 = opcode
+	a.jump(bpfJEQ|bpfSrcK, r9, 0, scsiATAPass16, "ata16")
+	a.jump(bpfJEQ|bpfSrcK, r9, 0, scsiATAPass12, "ata12")
+	a.jump(bpfJNE|bpfSrcK, r9, 0, scsiTestUnitReady, "overflow")
+	a.jump(bpfJNE|bpfSrcK, r8, 0, 6, "overflow")
+	a.jump(bpfJA, 0, 0, 0, "exit")
+	// an ata pass-through: the length, the non-data protocol, then the ata
+	// command and feature at the places each form keeps them
+	ata := func(p string, n int32, cmd, featLo, featHi int16) {
+		a.label(p)
+		a.jump(bpfJNE|bpfSrcK, r8, 0, n, "overflow")
+		cdb(r9, 1)
+		a.emit(andImm(r9, ataProtoMask))
+		a.jump(bpfJNE|bpfSrcK, r9, 0, ataProtoNonData, "overflow")
+		cdb(r9, cmd)
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, ataCheckPower, "exit")
+		a.jump(bpfJNE|bpfSrcK, r9, 0, ataSMART, "overflow")
+		cdb(r9, featLo)
+		a.jump(bpfJNE|bpfSrcK, r9, 0, ataSMARTStatus, "overflow")
+		if featHi >= 0 {
+			cdb(r9, featHi)
+			a.jump(bpfJNE|bpfSrcK, r9, 0, 0, "overflow")
+		}
+		a.jump(bpfJA, 0, 0, 0, "exit")
+	}
+	ata("ata16", 16, 14, 4, 3)
+	ata("ata12", 12, 9, 3, -1)
+}
+
+// counts a completion that could not be placed and ends the program, at
+// labels p+"overflow" and p+"exit"
 func emitTrackOverflow(a *bpfAsm, p string, statsMapFD int) {
 	a.label(p + "overflow")
 	a.emit(stImm(bpfSizeW, r10, -4, statOverflow))

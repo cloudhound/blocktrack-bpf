@@ -13,6 +13,14 @@ agent falls back to a full read. It reads the request structure directly, with
 field offsets taken from the running kernel's BTF, so it needs no kernel
 headers, no compiler on the host and no per-kernel build.
 
+On a SCSI disk (the `sd` driver) a completed command that moved no data is
+checked against a short list of commands that cannot change the media: TEST
+UNIT READY, and the ATA PASS-THROUGH non-data forms of SMART RETURN STATUS and
+CHECK POWER MODE. The program reads the command bytes with
+`bpf_probe_read_kernel`, and lets a command through only when every read
+succeeds and its opcode, length and fields match exactly. Every other
+zero-data command still counts as a possible change.
+
 `blocktrack_mark_prog_linux.go` holds the mark-mode programs the agent uses
 while a cloud disk is replicated from snapshots. One program on
 `block_rq_issue` counts each write-class request's regions and records it as
