@@ -21,6 +21,14 @@ CHECK POWER MODE. The program reads the command bytes with
 succeeds and its opcode, length and fields match exactly. Every other
 zero-data command still counts as a possible change.
 
+On kernel 5.4, which has vmlinux BTF but no typed `block_rq_complete`
+tracepoint and no mmap-able maps, `buildTrackProgramClassic` emits a classic
+raw tracepoint program instead. It reads every kernel field with
+`bpf_probe_read` at the BTF offsets and treats any failed read as a request it
+cannot mark, so the agent reads the whole disk. It sets one byte per changed
+region in one of two buffers; the agent switches buffers and waits for a
+`membarrier` grace period before it reads the old one.
+
 `blocktrack_mark_prog_linux.go` holds the mark-mode programs the agent uses
 while a cloud disk is replicated from snapshots. One program on
 `block_rq_issue` counts each write-class request's regions and records it as

@@ -268,6 +268,11 @@ type trackLayout struct {
 	readOps     []int32  // REQ_OP_* values that never change data
 	dataInOps   []int32  // driver passthrough that moves data from the device (DRV_IN, SCSI_IN)
 	scsi        scsiPassLayout
+	// the kernel 5.4 mode: the program is attached by name with an untyped
+	// context, every read through a kernel pointer is a bpf_probe_read whose
+	// result is checked, and it marks one-byte dirty flags
+	// (buildTrackProgramClassic) instead of counters. attachBTFID is unused
+	classic bool
 }
 
 // where a scsi request's command bytes are, for letting the known-harmless
@@ -374,31 +379,9 @@ func trackLevels(regions uint32) (bases []uint32, cells uint32) {
 // dev has bit 31 clear. nothing is
 // counted, for any disk, before the device match, and a read leaves before it
 func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, regionMapFD, statsMapFD int) ([]bpfInsn, error) {
-	if dev >= 1<<31 {
-		return nil, fmt.Errorf("device number %#x cannot be compared by the program", dev)
-	}
-	if regions == 0 || regions > maxRegions {
-		return nil, fmt.Errorf("region count %d is outside 1..%d", regions, maxRegions)
-	}
-	if shift < minRegionShift || shift > maxRegionShift {
-		return nil, fmt.Errorf("region shift %d is outside %d..%d", shift, minRegionShift, maxRegionShift)
-	}
-	if len(l.writeOps) == 0 || len(l.readOps) == 0 {
-		return nil, fmt.Errorf("operation codes missing")
-	}
-	if l.qDisk.size == 0 && (l.qBDI.size == 0 || l.bdiOwner.size == 0 || l.devT.size == 0) {
-		return nil, fmt.Errorf("no way to find a request queue's disk")
-	}
-	if len(l.discardOps) > 0 && (l.bio.size == 0 || l.bioSector.size == 0 || l.bioSize.size == 0 || l.bioNext.size == 0) {
-		return nil, fmt.Errorf("no way to walk a discard's bios")
-	}
-	offs := map[string]int16{}
-	for name, f := range map[string]btfField{"sector": l.sector, "cmd_flags": l.cmdFlags, "bio": l.bio, "bio_sector": l.bioSector, "bio_size": l.bioSize, "bio_next": l.bioNext, "q": l.q, "q_disk": l.qDisk, "q_bdi": l.qBDI, "bdi_owner": l.bdiOwner, "devt": l.devT, "major": l.major, "first_minor": l.firstMinor} {
-		o, err := loadOff(f)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
-		}
-		offs[name] = o
+	offs, err := trackProgramOffsets(l, dev, shift, regions)
+	if err != nil {
+		return nil, err
 	}
 	bases, _ := trackLevels(regions)
 	a := newBpfAsm()
@@ -478,7 +461,7 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 	a.emit(rshImm(r4, 9))
 	a.emit(movReg(r8, r7))
 	a.emit(addReg(r8, r4))
-	emitTrackRange(a, "p", shift, regions, bases, regionMapFD, "overflow", "exit")
+	emitTrackRange(a, "p", shift, regions, bases, counterMark(regionMapFD), "overflow", "exit")
 
 	// the shared ends sit before the discard walk, which is longer than a
 	// jump reaches at the largest geometry: every walk block below has its
@@ -511,7 +494,7 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 			a.emit(addImm(r8, 511))
 			a.emit(rshImm(r8, 9))
 			a.emit(addReg(r8, r7))
-			emitTrackRange(a, p, shift, regions, bases, regionMapFD, p+"overflow", p+"next")
+			emitTrackRange(a, p, shift, regions, bases, counterMark(regionMapFD), p+"overflow", p+"next")
 			a.label(p + "next")
 			a.emit(ldx(bpfSizeDW, r9, r9, offs["bio_next"]))
 			a.jump(bpfJNE|bpfSrcK, r9, 0, 0, p+"more")
@@ -522,6 +505,38 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 		emitTrackFold(a, offs, shift, regions, bases, regionMapFD, statsMapFD)
 	}
 	return a.resolve()
+}
+
+// trackProgramOffsets checks what both builds of the program need and
+// returns the load displacement of every request, queue, disk and bio field
+func trackProgramOffsets(l trackLayout, dev uint32, shift uint, regions uint32) (map[string]int16, error) {
+	if dev >= 1<<31 {
+		return nil, fmt.Errorf("device number %#x cannot be compared by the program", dev)
+	}
+	if regions == 0 || regions > maxRegions {
+		return nil, fmt.Errorf("region count %d is outside 1..%d", regions, maxRegions)
+	}
+	if shift < minRegionShift || shift > maxRegionShift {
+		return nil, fmt.Errorf("region shift %d is outside %d..%d", shift, minRegionShift, maxRegionShift)
+	}
+	if len(l.writeOps) == 0 || len(l.readOps) == 0 {
+		return nil, fmt.Errorf("operation codes missing")
+	}
+	if l.qDisk.size == 0 && (l.qBDI.size == 0 || l.bdiOwner.size == 0 || l.devT.size == 0) {
+		return nil, fmt.Errorf("no way to find a request queue's disk")
+	}
+	if len(l.discardOps) > 0 && (l.bio.size == 0 || l.bioSector.size == 0 || l.bioSize.size == 0 || l.bioNext.size == 0) {
+		return nil, fmt.Errorf("no way to walk a discard's bios")
+	}
+	offs := map[string]int16{}
+	for name, f := range map[string]btfField{"sector": l.sector, "cmd_flags": l.cmdFlags, "bio": l.bio, "bio_sector": l.bioSector, "bio_size": l.bioSize, "bio_next": l.bioNext, "q": l.q, "q_disk": l.qDisk, "q_bdi": l.qBDI, "bdi_owner": l.bdiOwner, "devt": l.devT, "major": l.major, "first_minor": l.firstMinor} {
+		o, err := loadOff(f)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		offs[name] = o
+	}
+	return offs, nil
 }
 
 // emitTrackFold folds the rest of the chain from r9 into r1 = lowest start,
@@ -562,7 +577,7 @@ func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32,
 	a.label("foldrange")
 	a.emit(movReg(r7, r1))
 	a.emit(movReg(r8, r2))
-	emitTrackRange(a, "fold", shift, regions, bases, regionMapFD, "foldoverflow", "foldexit")
+	emitTrackRange(a, "fold", shift, regions, bases, counterMark(regionMapFD), "foldoverflow", "foldexit")
 	emitTrackOverflow(a, "fold", statsMapFD)
 }
 
@@ -656,8 +671,9 @@ func emitTrackOverflow(a *bpfAsm, p string, statsMapFD int) {
 // level reached are then counted, covering the range and less than three
 // times as much again. a range reaching past the regions the tracker was
 // sized for is counted, since its keys would land in the next level. r5 is
-// the base, r2-r4 scratch; r0-r5, r7 and r8 are clobbered
-func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uint32, regionMapFD int, overflow, next string) {
+// the base, r2-r4 scratch; r0-r5, r7 and r8 are clobbered. mark marks cell
+// r7, clobbering r0-r5 only
+func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uint32, mark func(a *bpfAsm, overflow, next string), overflow, next string) {
 	a.jump(bpfJGT|bpfSrcX, r8, r7, 0, p+"nonempty")
 	a.jump(bpfJA, 0, 0, 0, overflow)
 	a.label(p + "nonempty")
@@ -691,6 +707,16 @@ func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uin
 	a.emit(addReg(r8, r5))
 	for i := 0; i < trackUnroll; i++ {
 		a.jump(bpfJGT|bpfSrcX, r7, r8, 0, next)
+		mark(a, overflow, next)
+		a.emit(addImm(r7, 1))
+	}
+	a.jump(bpfJA, 0, 0, 0, next)
+}
+
+// adds one to counter r7 of the counter map. a missing value (unreachable
+// for an array map with the key in range) marks nothing
+func counterMark(regionMapFD int) func(a *bpfAsm, overflow, next string) {
+	return func(a *bpfAsm, overflow, next string) {
 		a.emit(stx(bpfSizeW, r10, r7, -4))
 		m := ldMapFD(r1, regionMapFD)
 		a.emit(m[0], m[1])
@@ -700,7 +726,317 @@ func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uin
 		a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, next)
 		a.emit(movImm(r1, 1))
 		a.emit(xaddDW(r0, r1, 0))
-		a.emit(addImm(r7, 1))
 	}
-	a.jump(bpfJA, 0, 0, 0, next)
+}
+
+// the kernel 5.4 mode (trackLayout.classic). before 5.5 a raw tracepoint
+// program is attached by the tracepoint's name, its context is the untyped
+// u64 argument array, and a read through any kernel pointer is a
+// bpf_probe_read call. that helper zero-fills its buffer and returns an error
+// on a fault and when the kernel is locked down for confidentiality; a zeroed
+// request would match no disk and drop its write without a trace, so every
+// call's result is checked and a failure counts as overflow. maps cannot be
+// mmap'd before 5.5 and a syscall lookup copies a value with a plain memcpy,
+// which can tear a counter the program is adding to, so this mode keeps no
+// counters in the kernel: it sets one-byte dirty flags in one of two buffers,
+// chosen by a control map only userspace writes, and userspace flips the
+// buffers and drains the one no program can still be writing
+// (classicTracker in blocktrack_linux.go)
+const (
+	bpfFuncProbeRead = 4    // bpf_probe_read, the only kernel read helper before 5.5
+	trackFlagChunk   = 4096 // one-byte flags per element of the flag map
+
+	// stack slots of the kernel 5.4 program, below the command check's
+	classicProbeSlot = -40 // a probe read's 8-byte buffer
+	classicBaseSlot  = -48 // the active buffer's first key (index * chunks)
+	classicOpSlot    = -56 // the request's operation
+	classicFoldLo    = -64 // the fold's lowest start
+	classicFoldEnd   = -72 // the fold's highest end
+	classicFoldTop   = -80 // the fold's highest start
+)
+
+// the flag map's elements per buffer: one flag per cell of every level, and
+// one more at index cells for the buffer's overflow flag. the flags of the
+// last element past that are padding nothing sets
+func trackFlagChunks(cells uint32) uint32 {
+	return (cells + trackFlagChunk) / trackFlagChunk
+}
+
+// where a cell's flag is: the element relative to the buffer's first key,
+// and the byte in it
+func trackFlagAt(cell uint32) (uint32, uint32) {
+	return cell / trackFlagChunk, cell % trackFlagChunk
+}
+
+// classicProbe emits dst = *(size *)(base + off) through bpf_probe_read into
+// the probe slot, and jumps to fail when the read does not succeed. base is
+// moved into r3 before r1 and r2 are set, so it may be any register but r3's
+// own scratch use; r0-r5 are clobbered
+func classicProbe(a *bpfAsm, dst, size, base uint8, off int16, fail string) {
+	n := int32(8)
+	if size == bpfSizeW {
+		n = 4
+	}
+	a.emit(movReg(r3, base))
+	a.emit(addImm(r3, int32(off)))
+	a.emit(movReg(r1, r10))
+	a.emit(addImm(r1, classicProbeSlot))
+	a.emit(movImm(r2, n))
+	a.emit(callHelper(bpfFuncProbeRead))
+	a.jump(bpfJNE|bpfSrcK, r0, 0, 0, fail)
+	a.emit(ldx(size, dst, r10, classicProbeSlot))
+}
+
+// buildTrackProgramClassic assembles the kernel 5.4 program for one disk. it
+// makes the decisions buildTrackProgram makes, in the same order, and sets a
+// dirty flag in the active buffer of flagMapFD (2 * trackFlagChunks(cells)
+// elements of trackFlagChunk bytes) where buildTrackProgram adds to a
+// counter. the active buffer is read once on entry from ctlMapFD (one u32,
+// 0 or 1); a control map that cannot be read sets the overflow flag of both
+// buffers. any failed probe read sets the overflow flag, before or after the
+// device match. registers: r6 = ctx, r9 = the request, then its queue and
+// disk, then a discard's bio; r7 = start sector then first cell; r8 = the
+// operation, then the end sector then last cell. r6-r9 survive the helper
+// calls; the operation and the active buffer's first key are kept in stack
+// slots, since r1-r5 do not
+func buildTrackProgramClassic(l trackLayout, dev uint32, shift uint, regions uint32, flagMapFD, ctlMapFD int) ([]bpfInsn, error) {
+	offs, err := trackProgramOffsets(l, dev, shift, regions)
+	if err != nil {
+		return nil, err
+	}
+	if l.scsi.usable() && l.scsi.probeRead != bpfFuncProbeRead {
+		return nil, fmt.Errorf("the kernel 5.4 command check calls helper %d, not bpf_probe_read", l.scsi.probeRead)
+	}
+	bases, cells := trackLevels(regions)
+	chunks := trackFlagChunks(cells)
+	ovKey, ovByte := trackFlagAt(cells)
+	mark := flagMark(flagMapFD)
+	ov := func(a *bpfAsm, p string) { emitFlagOverflow(a, p, flagMapFD, ovKey, ovByte) }
+	probe := classicProbe
+
+	a := newBpfAsm()
+	a.emit(movReg(r6, r1))
+	a.emit(stImm(bpfSizeW, r10, -4, 0))
+	c := ldMapFD(r1, ctlMapFD)
+	a.emit(c[0], c[1])
+	a.emit(movReg(r2, r10))
+	a.emit(addImm(r2, -4))
+	a.emit(callHelper(bpfFuncMapLookupElem))
+	a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, "noctl")
+	a.emit(ldx(bpfSizeW, r1, r0, 0))
+	a.emit(andImm(r1, 1))
+	a.emit(mulImm(r1, int32(chunks)))
+	a.emit(stx(bpfSizeDW, r10, r1, classicBaseSlot))
+
+	// the operation first, so a read leaves after one probe read; the sector
+	// is read only for what can change data
+	a.emit(ldx(bpfSizeDW, r9, r6, 0)) // r9 = rq
+	probe(a, r8, bpfSizeW, r9, offs["cmd_flags"], "overflow")
+	a.emit(andImm(r8, reqOpMask)) // r8 = op
+	a.emit(stx(bpfSizeDW, r10, r8, classicOpSlot))
+	for _, op := range l.readOps {
+		a.jump(bpfJEQ|bpfSrcK, r8, 0, op, "exit")
+	}
+	probe(a, r7, bpfSizeDW, r9, offs["sector"], "overflow")
+	// the queue's disk, as buildTrackProgram finds it
+	probe(a, r9, bpfSizeDW, r9, offs["q"], "overflow")
+	if l.qDisk.size != 0 {
+		probe(a, r9, bpfSizeDW, r9, offs["q_disk"], "overflow")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		probe(a, r8, bpfSizeW, r9, offs["major"], "overflow")
+		a.emit(lshImm(r8, 20))
+		probe(a, r0, bpfSizeW, r9, offs["first_minor"], "overflow")
+		a.emit(orReg(r0, r8))
+	} else {
+		probe(a, r9, bpfSizeDW, r9, offs["q_bdi"], "overflow")
+		// a queue with no bdi has no owner, as the btf program reads it
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		probe(a, r9, bpfSizeDW, r9, offs["bdi_owner"], "overflow")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		probe(a, r0, bpfSizeW, r9, offs["devt"], "overflow")
+	}
+	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), "exit")
+	a.emit(ldx(bpfSizeDW, r3, r10, classicOpSlot)) // r3 = op
+	for _, op := range l.writeOps {
+		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "write")
+	}
+	if l.scsi.usable() && len(l.dataInOps) > 0 {
+		for _, op := range l.dataInOps {
+			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "scsidatain")
+		}
+		a.jump(bpfJA, 0, 0, 0, "overflow")
+	}
+	a.label("passthrough")
+	a.emit(ldx(bpfSizeDW, r3, r10, classicOpSlot))
+	for _, op := range l.dataInOps {
+		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "datain")
+	}
+	a.jump(bpfJA, 0, 0, 0, "overflow")
+	if len(l.dataInOps) > 0 {
+		a.label("datain")
+		a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
+		a.jump(bpfJEQ|bpfSrcK, r4, 0, 0, "overflow")
+		a.jump(bpfJA, 0, 0, 0, "exit")
+		if l.scsi.usable() {
+			emitSCSIPass(a, l.scsi)
+		}
+	}
+
+	a.label("write")
+	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
+	a.jump(bpfJEQ|bpfSrcK, r4, 0, 0, "exit")
+	a.emit(ldx(bpfSizeDW, r3, r10, classicOpSlot))
+	for _, op := range l.discardOps {
+		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "discard")
+	}
+	a.emit(addImm(r4, 511))
+	a.emit(rshImm(r4, 9))
+	a.emit(movReg(r8, r7))
+	a.emit(addReg(r8, r4))
+	emitTrackRange(a, "p", shift, regions, bases, mark, "overflow", "exit")
+	ov(a, "")
+
+	// the control map is one array slot with key 0, so this is unreachable,
+	// but the verifier needs the branch and it fails closed: both buffers'
+	// overflow flags are set, so whichever one the next drain reads
+	// answers a full read
+	a.label("noctl")
+	for b := uint32(0); b < 2; b++ {
+		q := fmt.Sprintf("noctl%d", b)
+		a.emit(stImm(bpfSizeW, r10, -4, int32(b*chunks+ovKey)))
+		m := ldMapFD(r1, flagMapFD)
+		a.emit(m[0], m[1])
+		a.emit(movReg(r2, r10))
+		a.emit(addImm(r2, -4))
+		a.emit(callHelper(bpfFuncMapLookupElem))
+		a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, q)
+		a.emit(stImm(bpfSizeB, r0, int16(ovByte), 1))
+		a.label(q)
+	}
+	a.emit(movImm(r0, 0))
+	a.emit(exitInsn())
+
+	// the discard walk of buildTrackProgram, every bio read checked. jumps
+	// stay forward, so each block has its own copy of the overflow end
+	if len(l.discardOps) > 0 {
+		a.label("discard")
+		a.emit(ldx(bpfSizeDW, r9, r6, 0))
+		probe(a, r9, bpfSizeDW, r9, offs["bio"], "nobiooverflow")
+		a.jump(bpfJNE|bpfSrcK, r9, 0, 0, "walk")
+		ov(a, "nobio")
+		a.label("walk")
+		for i := 0; i < trackDiscardBios; i++ {
+			p := fmt.Sprintf("b%d", i)
+			probe(a, r7, bpfSizeDW, r9, offs["bio_sector"], p+"overflow")
+			probe(a, r8, bpfSizeW, r9, offs["bio_size"], p+"overflow")
+			a.jump(bpfJEQ|bpfSrcK, r8, 0, 0, p+"next")
+			a.emit(addImm(r8, 511))
+			a.emit(rshImm(r8, 9))
+			a.emit(addReg(r8, r7))
+			emitTrackRange(a, p, shift, regions, bases, mark, p+"overflow", p+"next")
+			a.label(p + "next")
+			probe(a, r9, bpfSizeDW, r9, offs["bio_next"], p+"overflow")
+			a.jump(bpfJNE|bpfSrcK, r9, 0, 0, p+"more")
+			a.jump(bpfJA, 0, 0, 0, p+"exit")
+			ov(a, p)
+			a.label(p + "more")
+		}
+		emitClassicFold(a, offs, shift, regions, bases, mark, ov)
+	}
+	return a.resolve()
+}
+
+// emitClassicFold is emitTrackFold with every bio read checked. the probe
+// reads clobber r1-r5, so the lowest start, highest end and highest start
+// are kept in stack slots between bios, and each bio's start and end are in
+// r7 and r8
+func emitClassicFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32, bases []uint32, mark func(a *bpfAsm, overflow, next string), ov func(a *bpfAsm, p string)) {
+	a.emit(movImm(r1, 1))
+	a.emit(lshImm(r1, 62))
+	a.emit(stx(bpfSizeDW, r10, r1, classicFoldLo))
+	a.emit(movImm(r1, 0))
+	a.emit(stx(bpfSizeDW, r10, r1, classicFoldEnd))
+	a.emit(stx(bpfSizeDW, r10, r1, classicFoldTop))
+	for i := trackDiscardBios; i < trackDiscardChain; i++ {
+		q := fmt.Sprintf("f%d", i)
+		classicProbe(a, r7, bpfSizeDW, r9, offs["bio_sector"], "chainoverflow")
+		classicProbe(a, r8, bpfSizeW, r9, offs["bio_size"], "chainoverflow")
+		a.jump(bpfJEQ|bpfSrcK, r8, 0, 0, q+"next")
+		a.emit(addImm(r8, 511))
+		a.emit(rshImm(r8, 9))
+		a.emit(addReg(r8, r7))
+		a.emit(ldx(bpfSizeDW, r1, r10, classicFoldLo))
+		a.emit(ldx(bpfSizeDW, r2, r10, classicFoldEnd))
+		a.emit(ldx(bpfSizeDW, r3, r10, classicFoldTop))
+		// r1 += (r7 - r1) when r7 < r1
+		a.emit(movReg(r0, r7), subReg(r0, r1), movReg(r4, r0), rshImm(r4, 63), mulReg(r0, r4), addReg(r1, r0))
+		// r2 -= (r2 - r8) when r2 < r8
+		a.emit(movReg(r0, r2), subReg(r0, r8), movReg(r4, r0), rshImm(r4, 63), mulReg(r0, r4), subReg(r2, r0))
+		// r3 -= (r3 - r7) when r3 < r7
+		a.emit(movReg(r0, r3), subReg(r0, r7), movReg(r4, r0), rshImm(r4, 63), mulReg(r0, r4), subReg(r3, r0))
+		a.emit(stx(bpfSizeDW, r10, r1, classicFoldLo))
+		a.emit(stx(bpfSizeDW, r10, r2, classicFoldEnd))
+		a.emit(stx(bpfSizeDW, r10, r3, classicFoldTop))
+		a.label(q + "next")
+		classicProbe(a, r9, bpfSizeDW, r9, offs["bio_next"], "chainoverflow")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "foldmark")
+	}
+	ov(a, "chain")
+	a.label("foldmark")
+	a.emit(ldx(bpfSizeDW, r1, r10, classicFoldLo))
+	a.emit(ldx(bpfSizeDW, r2, r10, classicFoldEnd))
+	a.emit(ldx(bpfSizeDW, r3, r10, classicFoldTop))
+	// every bio past the walk was empty
+	a.jump(bpfJEQ|bpfSrcK, r2, 0, 0, "foldexit")
+	a.jump(bpfJGT|bpfSrcX, r2, r3, 0, "foldrange")
+	a.jump(bpfJA, 0, 0, 0, "foldoverflow")
+	a.label("foldrange")
+	a.emit(movReg(r7, r1))
+	a.emit(movReg(r8, r2))
+	emitTrackRange(a, "fold", shift, regions, bases, mark, "foldoverflow", "foldexit")
+	ov(a, "fold")
+}
+
+// sets the dirty flag of cell r7 in the active buffer: element base + (r7 >>
+// 12), byte r7 & 4095, which the verifier bounds inside the element. a store
+// of 1 is the same from every cpu, so racing completions need no atomics. a
+// missing element (unreachable for an array map with the key in range)
+// counts as overflow
+func flagMark(flagMapFD int) func(a *bpfAsm, overflow, next string) {
+	return func(a *bpfAsm, overflow, next string) {
+		a.emit(movReg(r2, r7))
+		a.emit(rshImm(r2, 12))
+		a.emit(ldx(bpfSizeDW, r1, r10, classicBaseSlot))
+		a.emit(addReg(r2, r1))
+		a.emit(stx(bpfSizeW, r10, r2, -4))
+		m := ldMapFD(r1, flagMapFD)
+		a.emit(m[0], m[1])
+		a.emit(movReg(r2, r10))
+		a.emit(addImm(r2, -4))
+		a.emit(callHelper(bpfFuncMapLookupElem))
+		a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, overflow)
+		a.emit(movReg(r1, r7))
+		a.emit(andImm(r1, trackFlagChunk-1))
+		a.emit(addReg(r0, r1))
+		a.emit(stImm(bpfSizeB, r0, 0, 1))
+	}
+}
+
+// sets the active buffer's overflow flag and ends the program, at labels
+// p+"overflow" and p+"exit"
+func emitFlagOverflow(a *bpfAsm, p string, flagMapFD int, ovKey, ovByte uint32) {
+	a.label(p + "overflow")
+	a.emit(ldx(bpfSizeDW, r2, r10, classicBaseSlot))
+	a.emit(addImm(r2, int32(ovKey)))
+	a.emit(stx(bpfSizeW, r10, r2, -4))
+	m := ldMapFD(r1, flagMapFD)
+	a.emit(m[0], m[1])
+	a.emit(movReg(r2, r10))
+	a.emit(addImm(r2, -4))
+	a.emit(callHelper(bpfFuncMapLookupElem))
+	a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, p+"exit")
+	a.emit(stImm(bpfSizeB, r0, int16(ovByte), 1))
+	a.label(p + "exit")
+	a.emit(movImm(r0, 0))
+	a.emit(exitInsn())
 }
