@@ -37,7 +37,7 @@ const bpfNoExist = 1
 // mark-mode stats map slots. any of them moving between two marks means a
 // write may have gone unrecorded, which ends the tracking session
 const (
-	markStatWideFull    = 0 // the wide range map refused an insert
+	markStatWideFull    = 0 // a wide range could be placed neither in the wide map nor in the fold tree
 	markStatInflightFull = 1 // the in-flight map refused an insert
 	markStatPassthrough = 2 // an operation on the disk that is neither a read nor a known write
 	markStatBios        = 3 // a discard carried more bios than the walk covers
@@ -46,6 +46,46 @@ const (
 
 // a discard's ranges are read from its bio chain, at most this many
 const markDiscardBios = 64
+
+// a wide range the wide map cannot take (it is full) is counted in the fold
+// tree instead: an array of markFoldLeaves*2 counters laid out as a binary
+// segment tree over cells of 1 << foldShift regions, node 1 the whole disk and
+// node markFoldLeaves+c cell c. a range adds one to the at most two nodes per
+// level that cover its cells exactly, so each count only grows and a mark
+// compares them as it does regions. a cell is wider than a region on any disk
+// of more than markFoldLeaves regions, so a range counted there is reported
+// rounded out to whole cells: more is read, never less
+const (
+	markFoldLeaves = 4096
+	markFoldLevels = 13 // log2(markFoldLeaves) + 1
+	markFoldNodes  = 2 * markFoldLeaves
+)
+
+// the smallest cell, in regions as a power of two, that puts the whole disk
+// in markFoldLeaves cells
+func markFoldShift(regions uint32) uint {
+	s := uint(0)
+	for (uint64(regions)+(1<<s)-1)>>s > markFoldLeaves {
+		s++
+	}
+	return s
+}
+
+// the regions node n of the fold tree covers, first and last inclusive, or
+// false for a node that is not in the tree
+func markFoldNodeRegions(n uint32, foldShift uint) (uint64, uint64, bool) {
+	if n == 0 || n >= markFoldNodes {
+		return 0, 0, false
+	}
+	level := uint(0)
+	for (n >> (level + 1)) != 0 {
+		level++
+	}
+	h := uint(markFoldLevels-1) - level
+	first := uint64(n-(1<<level)) << h
+	last := first + (1 << h) - 1
+	return first << foldShift, ((last + 1) << foldShift) - 1, true
+}
 
 // the in-flight map value: the request's hardware queue and driver tag (the
 // census matches them against blk-mq's own view) and the sectors it covers,
@@ -121,9 +161,12 @@ func emitStat(a *bpfAsm, statsMapFD int, slot int32, next string) {
 // adds one to its own counter in the wide map, keyed by its first and last
 // region, so the same range issued again is the same entry with a higher
 // count. userspace never deletes from the wide map, so a count can only
-// grow and a mark compares counts exactly as it does for regions. an empty
+// grow and a mark compares counts exactly as it does for regions. a wide
+// range the map cannot take widens the fold hull at fp-64 (lowest first
+// region) and fp-72 (highest last region) and continues at full, where the
+// hull is counted in the fold tree once per request (emitMarkFold). an empty
 // range records nothing. r7 and r8 are clobbered, as are r0-r5
-func emitMarkRange(a *bpfAsm, p string, shift uint, regionMapFD, wideMapFD, statsMapFD int, next string) {
+func emitMarkRange(a *bpfAsm, p string, shift uint, regionMapFD, wideMapFD int, next, full string) {
 	a.jump(bpfJGT|bpfSrcX, r8, r7, 0, p+"nonempty")
 	a.jump(bpfJA, 0, 0, 0, next)
 	a.label(p + "nonempty")
@@ -180,7 +223,79 @@ func emitMarkRange(a *bpfAsm, p string, shift uint, regionMapFD, wideMapFD, stat
 	a.emit(xaddDW(r0, r1, 0))
 	a.jump(bpfJA, 0, 0, 0, next)
 	a.label(p + "full")
-	emitStat(a, statsMapFD, markStatWideFull, next)
+	a.emit(ldx(bpfSizeDW, r1, r10, -48))
+	a.emit(movReg(r2, r1))
+	a.emit(rshImm(r2, 32)) // first
+	a.emit(lshImm(r1, 32))
+	a.emit(rshImm(r1, 32)) // last
+	a.emit(ldx(bpfSizeDW, r3, r10, -64))
+	a.jump(bpfJGT|bpfSrcX, r2, r3, 0, p+"keeplo")
+	a.emit(stx(bpfSizeDW, r10, r2, -64))
+	a.label(p + "keeplo")
+	a.emit(ldx(bpfSizeDW, r3, r10, -72))
+	a.jump(bpfJGT|bpfSrcX, r3, r1, 0, p+"keephi")
+	a.emit(stx(bpfSizeDW, r10, r1, -72))
+	a.label(p + "keephi")
+	a.jump(bpfJA, 0, 0, 0, full)
+}
+
+// counts the fold hull at fp-64/fp-72 in the fold tree and leaves for exit.
+// an empty hull (lowest above highest, as set before counting) counts
+// nothing. a hull past the tree's last cell is a range beyond the disk the
+// tracker was sized for and moves the wide witness; the size check on every
+// mark catches a grown disk the same way. r7-r9 and r0-r5 are clobbered
+func emitMarkFold(a *bpfAsm, foldShift uint, foldMapFD, statsMapFD int, exit string) {
+	a.label("fold")
+	a.emit(ldx(bpfSizeDW, r7, r10, -64))
+	a.emit(ldx(bpfSizeDW, r8, r10, -72))
+	a.jump(bpfJGT|bpfSrcX, r7, r8, 0, exit)
+	if foldShift > 0 {
+		a.emit(rshImm(r7, int32(foldShift)))
+		a.emit(rshImm(r8, int32(foldShift)))
+	}
+	a.jump(bpfJGT|bpfSrcK, r8, 0, markFoldLeaves-1, "foldpast")
+	// l = first leaf, r = one past the last leaf, walked up a level at a time
+	a.emit(addImm(r7, markFoldLeaves))
+	a.emit(addImm(r8, markFoldLeaves+1))
+	// adds r9 (0 or 1) to node reg. the add of 0 keeps the walk free of
+	// branches, so the verifier sees one path per level
+	add := func(reg uint8) {
+		a.emit(stx(bpfSizeW, r10, reg, -4))
+		m := ldMapFD(r1, foldMapFD)
+		a.emit(m[0], m[1])
+		a.emit(movReg(r2, r10))
+		a.emit(addImm(r2, -4))
+		a.emit(callHelper(bpfFuncMapLookupElem))
+		a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, "foldpast")
+		a.emit(xaddDW(r0, r9, 0))
+	}
+	for i := 0; i < markFoldLevels; i++ {
+		p := fmt.Sprintf("f%d", i)
+		a.jump(bpfJGT|bpfSrcX, r8, r7, 0, p+"go")
+		a.jump(bpfJA, 0, 0, 0, exit)
+		a.label(p + "go")
+		// an odd l is a right child: count it and step past it
+		a.emit(movReg(r9, r7))
+		a.emit(andImm(r9, 1))
+		add(r7)
+		a.emit(addReg(r7, r9))
+		// an odd r means r-1 is a left child: count it and step before it.
+		// the node r-1 is in the tree whatever r is, so the add of 0 lands
+		// inside it
+		a.emit(movReg(r9, r8))
+		a.emit(andImm(r9, 1))
+		a.emit(subImm(r8, 1))
+		add(r8)
+		a.emit(addImm(r8, 1))
+		a.emit(subReg(r8, r9))
+		a.emit(rshImm(r7, 1))
+		a.emit(rshImm(r8, 1))
+	}
+	a.jump(bpfJA, 0, 0, 0, exit)
+	// a node lookup cannot fail inside the tree; one that does is counted
+	// as a range that was not placed
+	a.label("foldpast")
+	emitStat(a, statsMapFD, markStatWideFull, exit)
 }
 
 // looks up the wide map entry keyed at fp-48 into r0
@@ -211,9 +326,9 @@ func markOffsets(l markLayout) (map[string]int16, error) {
 // counters before the in-flight map, so a write counted before the counter
 // read is either still in the map when the map is read or already complete.
 // stack: -8 key (request address), -32..-9 in-flight value, -48 wide key, -56
-// wide value, -4 map index. registers: r6 = request, r7/r8 = range, r9 = the
-// bio being walked (and the disk during the match)
-func buildMarkIssueProgram(l markLayout, dev uint32, shift uint, regionMapFD, wideMapFD, inflightMapFD, statsMapFD int) ([]bpfInsn, error) {
+// wide value, -64/-72 fold hull, -4 map index. registers: r6 = request, r7/r8
+// = range, r9 = the bio being walked (and the disk during the match)
+func buildMarkIssueProgram(l markLayout, dev uint32, shift, foldShift uint, regionMapFD, wideMapFD, inflightMapFD, statsMapFD, foldMapFD int) ([]bpfInsn, error) {
 	if dev >= 1<<31 {
 		return nil, fmt.Errorf("device number %#x cannot be compared by the program", dev)
 	}
@@ -222,6 +337,9 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift uint, regionMapFD, wi
 	}
 	if l.issueRqArg < 0 || l.issueRqArg > 3 {
 		return nil, fmt.Errorf("request argument %d", l.issueRqArg)
+	}
+	if foldShift > 20 {
+		return nil, fmt.Errorf("fold cell shift %d", foldShift)
 	}
 	offs, err := markOffsets(l)
 	if err != nil {
@@ -311,6 +429,13 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift uint, regionMapFD, wi
 
 	// count: a plain write is its one range, a discard each of its bios
 	a.label("count")
+	// the fold hull starts empty: lowest all ones, highest zero. both are
+	// spilled from a register, as the hull's updates are, so the verifier
+	// compares the slots as scalars on every path
+	a.emit(movImm(r1, -1))
+	a.emit(stx(bpfSizeDW, r10, r1, -64))
+	a.emit(movImm(r1, 0))
+	a.emit(stx(bpfSizeDW, r10, r1, -72))
 	a.emit(ldx(bpfSizeW, r3, r6, offs["cmd_flags"]))
 	a.emit(andImm(r3, reqOpMask))
 	for _, op := range l.rangeOps {
@@ -318,22 +443,25 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift uint, regionMapFD, wi
 	}
 	a.emit(ldx(bpfSizeDW, r7, r10, -24))
 	a.emit(ldx(bpfSizeDW, r8, r10, -16))
-	emitMarkRange(a, "p", shift, regionMapFD, wideMapFD, statsMapFD, "exit")
+	emitMarkRange(a, "p", shift, regionMapFD, wideMapFD, "exit", "fold")
 
+	// every bio of a discard is placed first; the ones the wide map could
+	// not take are counted in the fold tree together at the end
 	a.label("bios")
 	a.emit(ldx(bpfSizeDW, r9, r6, offs["bio"]))
 	for i := 0; i < markDiscardBios; i++ {
 		p := fmt.Sprintf("b%d", i)
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "exit")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "fold")
 		a.emit(ldx(bpfSizeDW, r7, r9, offs["bio_sector"]))
 		a.emit(ldx(bpfSizeW, r8, r9, offs["bio_size"]))
 		a.emit(rshImm(r8, 9))
 		a.emit(addReg(r8, r7))
-		emitMarkRange(a, p, shift, regionMapFD, wideMapFD, statsMapFD, p+"next")
+		emitMarkRange(a, p, shift, regionMapFD, wideMapFD, p+"next", p+"next")
 		a.label(p + "next")
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["bio_next"]))
 	}
-	a.jump(bpfJA, 0, 0, 0, "exit")
+	a.jump(bpfJA, 0, 0, 0, "fold")
+	emitMarkFold(a, foldShift, foldMapFD, statsMapFD, "exit")
 
 	a.label("nodisk")
 	a.emit(ldx(bpfSizeW, r3, r6, offs["cmd_flags"]))
