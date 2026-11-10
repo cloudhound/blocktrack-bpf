@@ -514,7 +514,7 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 	a.emit(rshImm(r4, 9))
 	a.emit(movReg(r8, r7))
 	a.emit(addReg(r8, r4))
-	emitTrackRange(a, "p", shift, regions, bases, counterMark(regionMapFD), "overflow", "exit")
+	emitTrackRange(a, "p", shift, regions, bases, counterMark(regionMapFD), true, "overflow", "exit")
 
 	// the shared ends sit before the discard walk, which is longer than a
 	// jump reaches at the largest geometry: every walk block below has its
@@ -547,7 +547,7 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 			a.emit(addImm(r8, 511))
 			a.emit(rshImm(r8, 9))
 			a.emit(addReg(r8, r7))
-			emitTrackRange(a, p, shift, regions, bases, counterMark(regionMapFD), p+"overflow", p+"next")
+			emitTrackRange(a, p, shift, regions, bases, counterMark(regionMapFD), false, p+"overflow", p+"next")
 			a.label(p + "next")
 			a.emit(ldx(bpfSizeDW, r9, r9, offs["bio_next"]))
 			a.jump(bpfJNE|bpfSrcK, r9, 0, 0, p+"more")
@@ -630,7 +630,7 @@ func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32,
 	a.label("foldrange")
 	a.emit(movReg(r7, r1))
 	a.emit(movReg(r8, r2))
-	emitTrackRange(a, "fold", shift, regions, bases, counterMark(regionMapFD), "foldoverflow", "foldexit")
+	emitTrackRange(a, "fold", shift, regions, bases, counterMark(regionMapFD), false, "foldoverflow", "foldexit")
 	emitTrackOverflow(a, "fold", statsMapFD)
 }
 
@@ -774,8 +774,14 @@ func emitTrackOverflow(a *bpfAsm, p string, statsMapFD int) {
 // times as much again. a range reaching past the regions the tracker was
 // sized for is counted, since its keys would land in the next level. r5 is
 // the base, r2-r4 scratch; r0-r5, r7 and r8 are clobbered. mark marks cell
-// r7, clobbering r0-r5 only
-func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uint32, mark func(a *bpfAsm, overflow, next string), overflow, next string) {
+// r7, clobbering r0-r5 only. with direct, a range of at most trackUnroll
+// regions skips the walk and marks its level 0 cells, which is where the walk
+// leaves it: every carry is 0. a plain write is at most max_sectors_kb, so
+// nearly every one takes that path, and on a 100 GiB disk of 1 MiB regions
+// the walk it skips is 135 instructions; a wider one still walks. the discard
+// blocks keep the one path, so the verifier's states do not double for each
+// of their ranges
+func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uint32, mark func(a *bpfAsm, overflow, next string), direct bool, overflow, next string) {
 	a.jump(bpfJGT|bpfSrcX, r8, r7, 0, p+"nonempty")
 	a.jump(bpfJA, 0, 0, 0, overflow)
 	a.label(p + "nonempty")
@@ -784,6 +790,13 @@ func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uin
 	a.emit(rshImm(r7, int32(shift-9)))
 	a.jump(bpfJGT|bpfSrcK, r8, 0, int32(regions-1), overflow)
 	a.emit(movImm(r5, 0))
+	if direct && len(bases) > 1 {
+		a.emit(movReg(r2, r8))
+		a.emit(subReg(r2, r7))
+		a.jump(bpfJGT|bpfSrcK, r2, 0, trackUnroll-1, p+"ladder")
+		a.jump(bpfJA, 0, 0, 0, p+"cells")
+		a.label(p + "ladder")
+	}
 	for lv := 0; lv+1 < len(bases); lv++ {
 		a.emit(movReg(r2, r8))
 		a.emit(subReg(r2, r7))
@@ -805,6 +818,9 @@ func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uin
 	a.emit(movReg(r2, r8))
 	a.emit(subReg(r2, r7))
 	a.jump(bpfJGT|bpfSrcK, r2, 0, trackUnroll-1, overflow)
+	if direct && len(bases) > 1 {
+		a.label(p + "cells")
+	}
 	a.emit(addReg(r7, r5))
 	a.emit(addReg(r8, r5))
 	for i := 0; i < trackUnroll; i++ {
@@ -995,7 +1011,7 @@ func buildTrackProgramClassic(l trackLayout, dev uint32, shift uint, regions uin
 	a.emit(rshImm(r4, 9))
 	a.emit(movReg(r8, r7))
 	a.emit(addReg(r8, r4))
-	emitTrackRange(a, "p", shift, regions, bases, mark, "overflow", "exit")
+	emitTrackRange(a, "p", shift, regions, bases, mark, true, "overflow", "exit")
 	ov(a, "")
 
 	// the control map is one array slot with key 0, so this is unreachable,
@@ -1035,7 +1051,7 @@ func buildTrackProgramClassic(l trackLayout, dev uint32, shift uint, regions uin
 			a.emit(addImm(r8, 511))
 			a.emit(rshImm(r8, 9))
 			a.emit(addReg(r8, r7))
-			emitTrackRange(a, p, shift, regions, bases, mark, p+"overflow", p+"next")
+			emitTrackRange(a, p, shift, regions, bases, mark, false, p+"overflow", p+"next")
 			a.label(p + "next")
 			probe(a, r9, bpfSizeDW, r9, offs["bio_next"], p+"overflow")
 			a.jump(bpfJNE|bpfSrcK, r9, 0, 0, p+"more")
@@ -1095,7 +1111,7 @@ func emitClassicFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint3
 	a.label("foldrange")
 	a.emit(movReg(r7, r1))
 	a.emit(movReg(r8, r2))
-	emitTrackRange(a, "fold", shift, regions, bases, mark, "foldoverflow", "foldexit")
+	emitTrackRange(a, "fold", shift, regions, bases, mark, false, "foldoverflow", "foldexit")
 	ov(a, "fold")
 }
 
