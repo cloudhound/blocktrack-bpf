@@ -232,7 +232,8 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift uint, regionMapFD, wi
 	// every request on this disk's queue is judged as this disk's, whatever
 	// disk it names. a queue with no disk (an nvme controller's admin queue,
 	// which carries format and sanitize) can still change this disk's data,
-	// so anything but a read there moves the witness
+	// so anything but a read or a proven nvme admin query there moves the
+	// witness
 	emitDiskMatch(a, l.trackLayout, offs, r6, dev, "exit", "nodisk")
 	a.emit(ldx(bpfSizeW, r3, r6, offs["cmd_flags"]))
 	a.emit(andImm(r3, reqOpMask))
@@ -339,6 +340,12 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift uint, regionMapFD, wi
 	a.emit(andImm(r3, reqOpMask))
 	for _, op := range l.readOps {
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "exit")
+	}
+	// an nvme controller's queries (hwmon threshold reads, smart and identify
+	// from monitoring tools) leave too. the check uses the stack slots the
+	// write path does, which nothing on this path has written
+	if l.nvme.usable() {
+		emitNVMeAdminPass(a, l.nvme, offs["q"], movReg(r7, r6))
 	}
 	emitStat(a, statsMapFD, markStatPassthrough, "exit")
 

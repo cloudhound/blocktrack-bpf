@@ -480,7 +480,7 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 		a.label("nodisk")
 		// r3 is the operation and the check's helper calls clobber it
 		a.emit(stx(bpfSizeDW, r10, r3, nvmeReqSlot))
-		emitNVMeAdminPass(a, l.nvme, offs["q"])
+		emitNVMeAdminPass(a, l.nvme, offs["q"], ldx(bpfSizeDW, r7, r6, 0))
 		a.emit(ldx(bpfSizeDW, r3, r10, nvmeReqSlot))
 	}
 	a.label("passthrough")
@@ -704,8 +704,10 @@ func emitSCSIPass(a *bpfAsm, s scsiPassLayout) {
 // has this queue as its admin queue and its admin tag set is the queue's tag
 // set. either test alone could pass by chance on another driver's
 // per-request data (a scsi_cmnd points at a scsi_device that names its own
-// queue), so both must hold. clobbers r0-r5 and r7-r9
-func emitNVMeAdminPass(a *bpfAsm, n nvmeAdminLayout, qOff int16) {
+// queue), so both must hold. loadRq puts the request in r7 (the completion
+// program reads it from its context, the mark issue program copies it from
+// r6). clobbers r0-r5 and r7-r9
+func emitNVMeAdminPass(a *bpfAsm, n nvmeAdminLayout, qOff int16, loadRq bpfInsn) {
 	read := func(slot int16, size int32, src uint8, off int32) {
 		a.emit(movReg(r1, r10))
 		a.emit(addImm(r1, int32(slot)))
@@ -715,7 +717,7 @@ func emitNVMeAdminPass(a *bpfAsm, n nvmeAdminLayout, qOff int16) {
 		a.emit(callHelper(n.probeRead))
 		a.jump(bpfJNE|bpfSrcK, r0, 0, 0, "nvmeother")
 	}
-	a.emit(ldx(bpfSizeDW, r7, r6, 0)) // r7 = rq
+	a.emit(loadRq)
 	read(nvmeQSlot, 8, r7, int32(qOff))
 	a.emit(ldx(bpfSizeDW, r9, r10, nvmeQSlot)) // r9 = rq->q
 	a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nvmeother")
