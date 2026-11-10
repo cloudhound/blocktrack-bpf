@@ -268,6 +268,7 @@ type trackLayout struct {
 	readOps     []int32  // REQ_OP_* values that never change data
 	dataInOps   []int32  // driver passthrough that moves data from the device (DRV_IN, SCSI_IN)
 	scsi        scsiPassLayout
+	nvme        nvmeAdminLayout
 	// the kernel 5.4 mode: the program is attached by name with an untyped
 	// context, every read through a kernel pointer is a bpf_probe_read whose
 	// result is checked, and it marks one-byte dirty flags
@@ -287,6 +288,39 @@ type scsiPassLayout struct {
 }
 
 func (s scsiPassLayout) usable() bool { return s.probeRead != 0 }
+
+// where an nvme admin request's controller and command are, for letting the
+// queries an nvme controller's admin queue carries through (nvmeAdminFor).
+// the zero value turns the check off
+type nvmeAdminLayout struct {
+	probeRead  int32    // helper id of bpf_probe_read_kernel
+	pdu        uint32   // sizeof(struct request): every nvme driver puts struct nvme_request first in the per-request data after it
+	reqCmd     btfField // struct nvme_request .cmd (pointer to struct nvme_command, whose first byte is the opcode)
+	reqCtrl    btfField // struct nvme_request .ctrl (pointer)
+	ctrlAdminQ btfField // struct nvme_ctrl .admin_q (pointer)
+	ctrlTagSet btfField // struct nvme_ctrl .admin_tagset (pointer)
+	qTagSet    btfField // struct request_queue .tag_set (pointer)
+}
+
+func (n nvmeAdminLayout) usable() bool { return n.probeRead != 0 }
+
+// the admin opcodes let through on an nvme controller's admin queue: Get Log
+// Page, Identify, Abort, Get Features, Asynchronous Event Request and Keep
+// Alive. the nvme hwmon driver's temp*_min and temp*_max reads are Get
+// Features with no data (5.5+), the driver keeps an event request
+// outstanding on every controller, and fabrics hosts send keep alive every
+// few seconds. none of them can change the media. every other admin
+// command (Format NVM, Sanitize, namespace management, vendor codes) is
+// judged as before
+var nvmeAdminQueryOps = []int32{0x02, 0x06, 0x08, 0x0a, 0x0c, 0x18}
+
+// stack slots for the nvme admin check, which runs on its own path
+const (
+	nvmeQSlot   = -8  // the request's queue
+	nvmePtrSlot = -16 // the controller, then the command pointer
+	nvmeOpSlot  = -24 // the opcode, 1 byte
+	nvmeReqSlot = -32 // the request's operation, kept across the helper calls
+)
 
 // the operation codes that change what is on the disk. write-same is gone
 // from newer kernels and simply absent there; zone append is refused at
@@ -374,7 +408,10 @@ func trackLevels(regions uint32) (bases []uint32, cells uint32) {
 // operation, r9 = the disk then a discard's bio, r7 = start sector then
 // first region, r8 = end sector then last region, and in the scsi command
 // check r7 = the scsi_cmnd, r8 = the cdb pointer then cmd_len, r9 = a cdb
-// byte; r7, r8 and r9 survive the helper calls. the immediate compared
+// byte, and in the nvme admin check r7 = the request then its
+// nvme_request, r8 = the controller then the command and opcode, r9 = the
+// queue, with r3 kept in its stack slot; r7, r8 and r9 survive the helper
+// calls. the immediate compared
 // against dev is sign-extended by the 64-bit jump, so the caller guarantees
 // dev has bit 31 clear. nothing is
 // counted, for any disk, before the device match, and a read leaves before it
@@ -402,10 +439,14 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 	// with no disk is a controller's own: an nvme format or sanitize of this
 	// disk runs on the admin queue, so passthrough there is judged as if it
 	// were on this disk
+	nodisk := "passthrough"
+	if l.nvme.usable() {
+		nodisk = "nodisk"
+	}
 	a.emit(ldx(bpfSizeDW, r9, r2, offs["q"]))
 	if l.qDisk.size != 0 {
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["q_disk"]))
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, nodisk)
 		a.emit(ldx(bpfSizeW, r0, r9, offs["major"]))
 		a.emit(lshImm(r0, 20))
 		a.emit(ldx(bpfSizeW, r1, r9, offs["first_minor"]))
@@ -413,7 +454,7 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 	} else {
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["q_bdi"]))
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["bdi_owner"]))
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, nodisk)
 		a.emit(ldx(bpfSizeW, r0, r9, offs["devt"]))
 	}
 	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), "exit")
@@ -429,6 +470,18 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "scsidatain")
 		}
 		a.jump(bpfJA, 0, 0, 0, "overflow")
+	}
+	// a queue with no disk first meets the nvme admin check, which lets the
+	// controller's queries through; the disk's own passthrough skips it
+	if l.nvme.usable() {
+		if !(l.scsi.usable() && len(l.dataInOps) > 0) {
+			a.jump(bpfJA, 0, 0, 0, "passthrough")
+		}
+		a.label("nodisk")
+		// r3 is the operation and the check's helper calls clobber it
+		a.emit(stx(bpfSizeDW, r10, r3, nvmeReqSlot))
+		emitNVMeAdminPass(a, l.nvme, offs["q"])
+		a.emit(ldx(bpfSizeDW, r3, r10, nvmeReqSlot))
 	}
 	a.label("passthrough")
 	for _, op := range l.dataInOps {
@@ -641,6 +694,53 @@ func emitSCSIPass(a *bpfAsm, s scsiPassLayout) {
 	}
 	ata("ata16", 16, 14, 4, 3)
 	ata("ata12", 12, 9, 3, -1)
+}
+
+// a passthrough on a queue with no disk that is an nvme controller's admin
+// queue and carries one of nvmeAdminQueryOps leaves for exit. anything else,
+// including any probe read that fails, falls through to nvmeother at the
+// end of the block, where the caller judges it as before. the request is an
+// nvme admin request only when the controller its struct nvme_request names
+// has this queue as its admin queue and its admin tag set is the queue's tag
+// set. either test alone could pass by chance on another driver's
+// per-request data (a scsi_cmnd points at a scsi_device that names its own
+// queue), so both must hold. clobbers r0-r5 and r7-r9
+func emitNVMeAdminPass(a *bpfAsm, n nvmeAdminLayout, qOff int16) {
+	read := func(slot int16, size int32, src uint8, off int32) {
+		a.emit(movReg(r1, r10))
+		a.emit(addImm(r1, int32(slot)))
+		a.emit(movImm(r2, size))
+		a.emit(movReg(r3, src))
+		a.emit(addImm(r3, off))
+		a.emit(callHelper(n.probeRead))
+		a.jump(bpfJNE|bpfSrcK, r0, 0, 0, "nvmeother")
+	}
+	a.emit(ldx(bpfSizeDW, r7, r6, 0)) // r7 = rq
+	read(nvmeQSlot, 8, r7, int32(qOff))
+	a.emit(ldx(bpfSizeDW, r9, r10, nvmeQSlot)) // r9 = rq->q
+	a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nvmeother")
+	a.emit(addImm(r7, int32(n.pdu))) // r7 = the struct nvme_request after it
+	read(nvmePtrSlot, 8, r7, int32(n.reqCtrl.off))
+	a.emit(ldx(bpfSizeDW, r8, r10, nvmePtrSlot)) // r8 = its controller
+	a.jump(bpfJEQ|bpfSrcK, r8, 0, 0, "nvmeother")
+	read(nvmeQSlot, 8, r8, int32(n.ctrlAdminQ.off))
+	a.emit(ldx(bpfSizeDW, r1, r10, nvmeQSlot)) // r1 = the controller's admin queue
+	a.jump(bpfJNE|bpfSrcX, r1, r9, 0, "nvmeother")
+	read(nvmePtrSlot, 8, r8, int32(n.ctrlTagSet.off))
+	read(nvmeQSlot, 8, r9, int32(n.qTagSet.off))
+	a.emit(ldx(bpfSizeDW, r1, r10, nvmePtrSlot)) // r1 = the controller's admin tag set
+	a.emit(ldx(bpfSizeDW, r2, r10, nvmeQSlot))   // r2 = the queue's tag set
+	a.jump(bpfJEQ|bpfSrcK, r1, 0, 0, "nvmeother")
+	a.jump(bpfJNE|bpfSrcX, r1, r2, 0, "nvmeother")
+	read(nvmePtrSlot, 8, r7, int32(n.reqCmd.off))
+	a.emit(ldx(bpfSizeDW, r8, r10, nvmePtrSlot)) // r8 = the command
+	a.jump(bpfJEQ|bpfSrcK, r8, 0, 0, "nvmeother")
+	read(nvmeOpSlot, 1, r8, 0)
+	a.emit(ldx(bpfSizeB, r8, r10, nvmeOpSlot)) // r8 = the opcode
+	for _, op := range nvmeAdminQueryOps {
+		a.jump(bpfJEQ|bpfSrcK, r8, 0, op, "exit")
+	}
+	a.label("nvmeother")
 }
 
 // counts a completion that could not be placed and ends the program, at
