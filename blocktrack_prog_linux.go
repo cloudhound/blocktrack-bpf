@@ -153,6 +153,7 @@ func mulReg(dst, src uint8) bpfInsn { return mkInsn(bpfClassALU|bpfOpMUL|bpfSrcX
 func mulImm(dst uint8, imm int32) bpfInsn {
 	return mkInsn(bpfClassALU|bpfOpMUL|bpfSrcK, dst, 0, 0, imm)
 }
+func andReg(dst, src uint8) bpfInsn { return mkInsn(bpfClassALU|bpfOpAND|bpfSrcX, dst, src, 0, 0) }
 func andImm(dst uint8, imm int32) bpfInsn {
 	return mkInsn(bpfClassALU|bpfOpAND|bpfSrcK, dst, 0, 0, imm)
 }
@@ -178,6 +179,19 @@ func stx(size, dst, src uint8, off int16) bpfInsn {
 // completions on different cpus never lose an increment
 func xaddDW(dst, src uint8, off int16) bpfInsn {
 	return mkInsn(bpfClassSTX|bpfModeXADD|bpfSizeDW, dst, src, off, 0)
+}
+
+// the fetch flag of an atomic add (linux 5.12): src receives the old value.
+// arm64 compiles it to a fully ordered add, where the legacy add above is
+// unordered against the loads and stores around it
+const bpfFetch = 0x01
+
+// *(u64 *)(dst + off) += src atomically, a fetch add when fetch
+func atomicAddDW(fetch bool, dst, src uint8, off int16) bpfInsn {
+	if fetch {
+		return mkInsn(bpfClassSTX|bpfModeXADD|bpfSizeDW, dst, src, off, bpfFetch)
+	}
+	return xaddDW(dst, src, off)
 }
 
 // *(size *)(dst + off) = imm
@@ -416,6 +430,21 @@ func trackLevels(regions uint32) (bases []uint32, cells uint32) {
 // dev has bit 31 clear. nothing is
 // counted, for any disk, before the device match, and a read leaves before it
 func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, regionMapFD, statsMapFD int) ([]bpfInsn, error) {
+	return buildTrackProgramBanks(l, dev, shift, regions, regionMapFD, statsMapFD, nil)
+}
+
+// like buildTrackProgram, and also sets the disk's fine
+// banks when bank is not nil (blocktrack_bank_linux.go). every write then
+// moves the active counter up before it counts and down at every end after
+// it, so the plain write and the discard blocks have their own ends: the
+// shared ones are reached before the counter moves. a plain write of at most
+// trackFineUnroll fine cells counts its regions and then sets its fine
+// cells; a wider one, and every discard range, sets the ladder cell of each
+// counter cell it counts
+func buildTrackProgramBanks(l trackLayout, dev uint32, shift uint, regions uint32, regionMapFD, statsMapFD int, bank *trackBankProg) ([]bpfInsn, error) {
+	if bank != nil && (bank.fshift < fineShift || bank.fshift > shift || shift-bank.fshift > trackBankMaxPerRegion) {
+		return nil, fmt.Errorf("fine cell shift %d does not fit regions of shift %d", bank.fshift, shift)
+	}
 	offs, err := trackProgramOffsets(l, dev, shift, regions)
 	if err != nil {
 		return nil, err
@@ -510,16 +539,20 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 
 	// a plain write is the one range [__sector, __sector + nr_bytes), a
 	// partial byte count rounded up to a whole sector
-	a.emit(addImm(r4, 511))
-	a.emit(rshImm(r4, 9))
-	a.emit(movReg(r8, r7))
-	a.emit(addReg(r8, r4))
-	emitTrackRange(a, "p", shift, regions, bases, counterMark(regionMapFD), true, "overflow", "exit")
+	if bank == nil {
+		a.emit(addImm(r4, 511))
+		a.emit(rshImm(r4, 9))
+		a.emit(movReg(r8, r7))
+		a.emit(addReg(r8, r4))
+		emitTrackRange(a, "p", shift, regions, bases, counterMark(regionMapFD), true, "overflow", "exit")
+	} else {
+		emitBankedWrite(a, shift, regions, bases, regionMapFD, statsMapFD, bank)
+	}
 
 	// the shared ends sit before the discard walk, which is longer than a
 	// jump reaches at the largest geometry: every walk block below has its
 	// own copy of them
-	emitTrackOverflow(a, "", statsMapFD)
+	emitTrackOverflow(a, "", statsMapFD, nil)
 
 	// a discard merged from several ranges says nothing about them in its
 	// position and length, and part way through a partial completion its
@@ -532,12 +565,22 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 	// longer than trackDiscardChain, cannot be placed and is counted
 	if len(l.discardOps) > 0 {
 		a.label("discard")
+		mark := counterMark(regionMapFD)
+		if bank != nil {
+			mark = ladderMark(regionMapFD, bank)
+			// a failed lookup has moved nothing, so it ends at an overflow
+			// that leaves the counter alone
+			emitActiveUp(a, bank, "dpreoverflow")
+			a.jump(bpfJA, 0, 0, 0, "dgo")
+			emitTrackOverflow(a, "dpre", statsMapFD, nil)
+			a.label("dgo")
+		}
 		a.emit(ldx(bpfSizeDW, r9, r6, 0))
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["bio"]))
 		// jumps only go forward (no back-edge before linux 5.3), so the walk
 		// counts a missing chain at its own copy of the ends
 		a.jump(bpfJNE|bpfSrcK, r9, 0, 0, "walk")
-		emitTrackOverflow(a, "nobio", statsMapFD)
+		emitTrackOverflow(a, "nobio", statsMapFD, bank)
 		a.label("walk")
 		for i := 0; i < trackDiscardBios; i++ {
 			p := fmt.Sprintf("b%d", i)
@@ -547,15 +590,15 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 			a.emit(addImm(r8, 511))
 			a.emit(rshImm(r8, 9))
 			a.emit(addReg(r8, r7))
-			emitTrackRange(a, p, shift, regions, bases, counterMark(regionMapFD), false, p+"overflow", p+"next")
+			emitTrackRange(a, p, shift, regions, bases, mark, false, p+"overflow", p+"next")
 			a.label(p + "next")
 			a.emit(ldx(bpfSizeDW, r9, r9, offs["bio_next"]))
 			a.jump(bpfJNE|bpfSrcK, r9, 0, 0, p+"more")
 			a.jump(bpfJA, 0, 0, 0, p+"exit")
-			emitTrackOverflow(a, p, statsMapFD)
+			emitTrackOverflow(a, p, statsMapFD, bank)
 			a.label(p + "more")
 		}
-		emitTrackFold(a, offs, shift, regions, bases, regionMapFD, statsMapFD)
+		emitTrackFold(a, offs, shift, regions, bases, mark, statsMapFD, bank)
 	}
 	return a.resolve()
 }
@@ -598,7 +641,7 @@ func trackProgramOffsets(l trackLayout, dev uint32, shift uint, regions uint32) 
 // wrapped) is counted. the sums use the sign bit of a difference, which
 // holds because a bio's sector is inside its disk (the block layer refuses
 // one past the end at submit), far below 2^62
-func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32, bases []uint32, regionMapFD, statsMapFD int) {
+func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32, bases []uint32, mark func(a *bpfAsm, overflow, next string), statsMapFD int, bank *trackBankProg) {
 	a.emit(movImm(r1, 1))
 	a.emit(lshImm(r1, 62))
 	a.emit(movImm(r2, 0))
@@ -621,7 +664,7 @@ func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32,
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["bio_next"]))
 		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "foldmark")
 	}
-	emitTrackOverflow(a, "chain", statsMapFD)
+	emitTrackOverflow(a, "chain", statsMapFD, bank)
 	a.label("foldmark")
 	// every bio past the walk was empty
 	a.jump(bpfJEQ|bpfSrcK, r2, 0, 0, "foldexit")
@@ -630,8 +673,8 @@ func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32,
 	a.label("foldrange")
 	a.emit(movReg(r7, r1))
 	a.emit(movReg(r8, r2))
-	emitTrackRange(a, "fold", shift, regions, bases, counterMark(regionMapFD), false, "foldoverflow", "foldexit")
-	emitTrackOverflow(a, "fold", statsMapFD)
+	emitTrackRange(a, "fold", shift, regions, bases, mark, false, "foldoverflow", "foldexit")
+	emitTrackOverflow(a, "fold", statsMapFD, bank)
 }
 
 // the scsidatain block: a data-in passthrough on an sd
@@ -746,8 +789,9 @@ func emitNVMeAdminPass(a *bpfAsm, n nvmeAdminLayout, qOff int16, loadRq bpfInsn)
 }
 
 // counts a completion that could not be placed and ends the program, at
-// labels p+"overflow" and p+"exit"
-func emitTrackOverflow(a *bpfAsm, p string, statsMapFD int) {
+// labels p+"overflow" and p+"exit". with bank the end moves the active
+// counter back down, after everything the write set
+func emitTrackOverflow(a *bpfAsm, p string, statsMapFD int, bank *trackBankProg) {
 	a.label(p + "overflow")
 	a.emit(stImm(bpfSizeW, r10, -4, statOverflow))
 	s := ldMapFD(r1, statsMapFD)
@@ -759,6 +803,9 @@ func emitTrackOverflow(a *bpfAsm, p string, statsMapFD int) {
 	a.emit(movImm(r1, 1))
 	a.emit(xaddDW(r0, r1, 0))
 	a.label(p + "exit")
+	if bank != nil {
+		emitActiveDown(a, bank)
+	}
 	a.emit(movImm(r0, 0))
 	a.emit(exitInsn())
 }
@@ -834,6 +881,12 @@ func emitTrackRange(a *bpfAsm, p string, shift uint, regions uint32, bases []uin
 // adds one to counter r7 of the counter map. a missing value (unreachable
 // for an array map with the key in range) marks nothing
 func counterMark(regionMapFD int) func(a *bpfAsm, overflow, next string) {
+	return counterMarkWith(regionMapFD, false)
+}
+
+// counterMark with a fetch add when fetch, which orders the count before
+// the bank cells the write sets after it
+func counterMarkWith(regionMapFD int, fetch bool) func(a *bpfAsm, overflow, next string) {
 	return func(a *bpfAsm, overflow, next string) {
 		a.emit(stx(bpfSizeW, r10, r7, -4))
 		m := ldMapFD(r1, regionMapFD)
@@ -843,8 +896,128 @@ func counterMark(regionMapFD int) func(a *bpfAsm, overflow, next string) {
 		a.emit(callHelper(bpfFuncMapLookupElem))
 		a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, next)
 		a.emit(movImm(r1, 1))
-		a.emit(xaddDW(r0, r1, 0))
+		a.emit(atomicAddDW(fetch, r0, r1, 0))
 	}
+}
+
+// counts counter cell r7 and sets its ladder cell in both banks, so every
+// region under the cell reads whole. a missing ladder element (unreachable,
+// the map holds a ladder cell per counter cell) is an overflow
+func ladderMark(regionMapFD int, bank *trackBankProg) func(a *bpfAsm, overflow, next string) {
+	count := counterMarkWith(regionMapFD, bank.fetch)
+	return func(a *bpfAsm, overflow, next string) {
+		count(a, overflow, next)
+		emitBankCell(a, bank, r7, bank.ladder, false, overflow)
+	}
+}
+
+// stack slots of a banked write, below the command checks'
+const (
+	trackActiveSlot = -40 // the active counter's value pointer
+	trackStartSlot  = -48 // a plain write's start sector
+	trackEndSlot    = -56 // a plain write's end sector
+)
+
+// moves this cpu's active counter up and keeps its pointer for the ends; a
+// failed lookup jumps to fail with nothing moved. clobbers r0-r5
+func emitActiveUp(a *bpfAsm, bank *trackBankProg, fail string) {
+	a.emit(stImm(bpfSizeW, r10, -4, 0))
+	m := ldMapFD(r1, bank.activeFD)
+	a.emit(m[0], m[1])
+	a.emit(movReg(r2, r10))
+	a.emit(addImm(r2, -4))
+	a.emit(callHelper(bpfFuncMapLookupElem))
+	a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, fail)
+	a.emit(stx(bpfSizeDW, r10, r0, trackActiveSlot))
+	a.emit(movImm(r1, 1))
+	a.emit(atomicAddDW(bank.fetch, r0, r1, 0))
+}
+
+// moves the active counter emitActiveUp moved back down. the pointer is the
+// one the up kept, so a program moved to another cpu part way still brings
+// down the counter it raised. clobbers r1 and r2
+func emitActiveDown(a *bpfAsm, bank *trackBankProg) {
+	a.emit(ldx(bpfSizeDW, r1, r10, trackActiveSlot))
+	a.emit(movImm(r2, -1))
+	a.emit(atomicAddDW(bank.fetch, r1, r2, 0))
+}
+
+// sets cell idx+base of both banks to 1. with skip a cell both banks already
+// hold is left as it is, so a write to a block written since the clear dirties
+// no cache line. a missing element jumps to fail. clobbers r0-r5
+func emitBankCell(a *bpfAsm, bank *trackBankProg, idx uint8, base uint32, skip bool, fail string) {
+	a.emit(movReg(r1, idx))
+	if base != 0 {
+		a.emit(addImm(r1, int32(base)))
+	}
+	a.emit(rshImm(r1, 2))
+	a.emit(stx(bpfSizeW, r10, r1, -4))
+	m := ldMapFD(r1, bank.bankFD)
+	a.emit(m[0], m[1])
+	a.emit(movReg(r2, r10))
+	a.emit(addImm(r2, -4))
+	a.emit(callHelper(bpfFuncMapLookupElem))
+	a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, fail)
+	a.emit(movReg(r1, idx))
+	if base != 0 {
+		a.emit(addImm(r1, int32(base)))
+	}
+	a.emit(andImm(r1, 3))
+	a.emit(addReg(r0, r1))
+	done := fmt.Sprintf("bankset%d", len(a.ins))
+	if skip {
+		a.emit(ldx(bpfSizeB, r1, r0, 0))
+		a.emit(ldx(bpfSizeB, r2, r0, 4))
+		a.emit(andReg(r1, r2))
+		a.jump(bpfJNE|bpfSrcK, r1, 0, 0, done)
+	}
+	a.emit(stImm(bpfSizeB, r0, 0, 1))
+	a.emit(stImm(bpfSizeB, r0, 4, 1))
+	if skip {
+		a.label(done)
+	}
+}
+
+// the plain write of a disk with banks: [r7, r7 + nr_bytes) in sectors, the
+// active counter up first, then the count, then the fine or ladder cells,
+// ending at its own p ends, which bring the counter down
+func emitBankedWrite(a *bpfAsm, shift uint, regions uint32, bases []uint32, regionMapFD, statsMapFD int, bank *trackBankProg) {
+	emitActiveUp(a, bank, "overflow")
+	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed, clobbered by the lookup
+	a.emit(addImm(r4, 511))
+	a.emit(rshImm(r4, 9))
+	a.emit(movReg(r8, r7))
+	a.emit(addReg(r8, r4))
+	a.emit(stx(bpfSizeDW, r10, r7, trackStartSlot))
+	a.emit(stx(bpfSizeDW, r10, r8, trackEndSlot))
+	fs := int32(bank.fshift - 9)
+	// fine cells last - first; a range that wrapped reads as a huge count and
+	// takes the wide path, whose range check counts it
+	a.emit(movReg(r2, r8))
+	a.emit(subImm(r2, 1))
+	a.emit(rshImm(r2, fs))
+	a.emit(movReg(r3, r7))
+	a.emit(rshImm(r3, fs))
+	a.emit(subReg(r2, r3))
+	a.jump(bpfJGT|bpfSrcK, r2, 0, trackFineUnroll-1, "pwide")
+	emitTrackRange(a, "pn", shift, regions, bases, counterMarkWith(regionMapFD, bank.fetch), true, "poverflow", "pnfine")
+	a.label("pnfine")
+	a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
+	a.emit(rshImm(r7, fs))
+	a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
+	a.emit(subImm(r8, 1))
+	a.emit(rshImm(r8, fs))
+	for i := 0; i < trackFineUnroll; i++ {
+		a.jump(bpfJGT|bpfSrcX, r7, r8, 0, "pexit")
+		emitBankCell(a, bank, r7, 0, true, "poverflow")
+		a.emit(addImm(r7, 1))
+	}
+	a.jump(bpfJA, 0, 0, 0, "pexit")
+	a.label("pwide")
+	a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
+	a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
+	emitTrackRange(a, "pw", shift, regions, bases, ladderMark(regionMapFD, bank), true, "poverflow", "pexit")
+	emitTrackOverflow(a, "p", statsMapFD, bank)
 }
 
 // the kernel 5.4 mode (trackLayout.classic). before 5.5 a raw tracepoint
