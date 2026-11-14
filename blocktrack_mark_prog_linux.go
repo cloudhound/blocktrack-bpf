@@ -106,165 +106,6 @@ type markLayout struct {
 	readOps       []int32  // operations that never change data
 	plainOps      []int32  // write-class operations with one contiguous range
 	rangeOps      []int32  // discard-class operations whose ranges come from the bios
-	scsiQ         markSCSILayout
-}
-
-// where an sd request's command is when block_rq_issue fires, for letting the
-// queries on markSCSIRules through. the zero value turns the check off, and a
-// disk that is not an sd disk on blk-mq always has it off. struct scsi_cmnd's
-// own cmnd and cmd_len cannot be used before 5.18: on 4.18 the scsi layer
-// clears them, starts the request (the tracepoint) and only then points them
-// at the command, so the issuer's struct scsi_request (scsi_cmnd's first
-// member there, which the clear leaves) is read instead. from 5.18 the issuer
-// writes the bytes into scsi_cmnd.cmnd itself
-type markSCSILayout struct {
-	probeRead int32  // helper id of bpf_probe_read_kernel
-	pdu       uint32 // sizeof(struct request): the struct scsi_cmnd after it
-	cmdLen    uint32 // offset in struct scsi_cmnd of the command length (u16)
-	cmd       uint32 // offset in struct scsi_cmnd of the command bytes, or of the pointer to them
-	inline    bool   // cmd holds the bytes (5.18+), else it points to them
-	own       uint32 // pointer form: offset in struct scsi_cmnd of the issuer's own 16 command bytes
-}
-
-func (s markSCSILayout) usable() bool { return s.probeRead != 0 }
-
-// one command a mark program lets through on an sd disk: its opcode, its
-// exact length, whether it moves data from the device (__data_len != 0) or
-// none, and the bytes that must hold the given value under the mask
-type markSCSIRule struct {
-	name   string
-	op     uint8
-	len    uint8
-	dataIn bool
-	tests  []markSCSIByte
-}
-
-type markSCSIByte struct{ at, mask, val uint8 }
-
-// the commands that cannot change the media, matched exactly. the ones with
-// no data phase are TEST UNIT READY (udev's re-probe, multipathd's tur
-// checker, smartd) and ATA PASS-THROUGH with the non-data protocol carrying
-// CHECK POWER MODE or SMART RETURN STATUS (smartd on sata). the ones that
-// move data from the device are the queries udev's scsi_id, smartctl, smartd,
-// sg_inq, sg_readcap and the kernel's own revalidation send (captured on
-// compute engine kernels 4.18 to 7.0), plus READ for multipathd's
-// readsector0 checker. the data phase must match: a FORMAT UNIT, SANITIZE or
-// WRITE SAME sent with a buffer from the device still counts, as does any
-// command off the list, any length but the one given and any read of the
-// command that fails
-var markSCSIRules = []markSCSIRule{
-	{name: "test unit ready", op: 0x00, len: 6},
-	{name: "ata pass-through(16) check power mode", op: 0x85, len: 16, tests: []markSCSIByte{{1, ataProtoMask, ataProtoNonData}, {14, 0xff, ataCheckPower}}},
-	{name: "ata pass-through(16) smart return status", op: 0x85, len: 16, tests: []markSCSIByte{{1, ataProtoMask, ataProtoNonData}, {14, 0xff, ataSMART}, {4, 0xff, ataSMARTStatus}, {3, 0xff, 0}}},
-	{name: "ata pass-through(12) check power mode", op: 0xa1, len: 12, tests: []markSCSIByte{{1, ataProtoMask, ataProtoNonData}, {9, 0xff, ataCheckPower}}},
-	{name: "ata pass-through(12) smart return status", op: 0xa1, len: 12, tests: []markSCSIByte{{1, ataProtoMask, ataProtoNonData}, {9, 0xff, ataSMART}, {3, 0xff, ataSMARTStatus}}},
-	{name: "inquiry", op: 0x12, len: 6, dataIn: true},
-	{name: "request sense", op: 0x03, len: 6, dataIn: true},
-	{name: "mode sense(6)", op: 0x1a, len: 6, dataIn: true},
-	{name: "mode sense(10)", op: 0x5a, len: 10, dataIn: true},
-	{name: "read capacity(10)", op: 0x25, len: 10, dataIn: true},
-	{name: "read capacity(16)", op: 0x9e, len: 16, dataIn: true, tests: []markSCSIByte{{1, 0x1f, 0x10}}},
-	{name: "get lba status", op: 0x9e, len: 16, dataIn: true, tests: []markSCSIByte{{1, 0x1f, 0x12}}},
-	{name: "persistent reserve in", op: 0x5e, len: 10, dataIn: true},
-	{name: "report luns", op: 0xa0, len: 12, dataIn: true},
-	{name: "log sense", op: 0x4d, len: 10, dataIn: true},
-	{name: "receive diagnostic results", op: 0x1c, len: 6, dataIn: true},
-	{name: "report target port groups", op: 0xa3, len: 12, dataIn: true, tests: []markSCSIByte{{1, 0x1f, 0x0a}}},
-	{name: "report supported operation codes", op: 0xa3, len: 12, dataIn: true, tests: []markSCSIByte{{1, 0x1f, 0x0c}}},
-	{name: "report supported task management functions", op: 0xa3, len: 12, dataIn: true, tests: []markSCSIByte{{1, 0x1f, 0x0d}}},
-	{name: "read defect data(10)", op: 0x37, len: 10, dataIn: true},
-	{name: "read defect data(12)", op: 0xb7, len: 12, dataIn: true},
-	{name: "read(10)", op: 0x28, len: 10, dataIn: true},
-	{name: "read(16)", op: 0x88, len: 16, dataIn: true},
-}
-
-// whether a mark program lets a command through: the same table the program
-// is built from, for blktrace-free tests and the shared-table proof
-func markSCSIAllowed(cdb []byte, cmdLen int, dataIn bool) bool {
-	if len(cdb) == 0 {
-		return false
-	}
-	for _, r := range markSCSIRules {
-		if cdb[0] != r.op || cmdLen != int(r.len) || dataIn != r.dataIn {
-			continue
-		}
-		ok := true
-		for _, t := range r.tests {
-			if int(t.at) >= len(cdb) || cdb[t.at]&t.mask != t.val {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return true
-		}
-	}
-	return false
-}
-
-// the scsiquery block: a data-in passthrough on an sd disk's own queue whose
-// command is on markSCSIRules leaves for exit; anything else, and any read of
-// the command that fails, falls through to scsiother at the end of the block,
-// where the caller counts it. the command is read with bpf_probe_read_kernel,
-// since the verifier bounds btf loads to struct request. a failed read
-// zero-fills its buffer and zero is TEST UNIT READY's opcode, so every read's
-// result is checked and the length must match a rule exactly. r6 is the
-// request. uses the stack slots the write path does, which nothing on this
-// path has written. clobbers r0-r5 and r7-r9
-func emitMarkSCSIPass(a *bpfAsm, s markSCSILayout, dataLenOff int16) {
-	a.label("scsiquery")
-	a.emit(movReg(r7, r6))
-	a.emit(addImm(r7, int32(s.pdu))) // r7 = the struct scsi_cmnd after it
-	read := func(slot int16, size int32, src uint8, off int32) {
-		a.emit(movReg(r1, r10))
-		a.emit(addImm(r1, int32(slot)))
-		a.emit(movImm(r2, size))
-		a.emit(movReg(r3, src))
-		a.emit(addImm(r3, off))
-		a.emit(callHelper(s.probeRead))
-		a.jump(bpfJNE|bpfSrcK, r0, 0, 0, "scsiother")
-	}
-	read(scsiCmdLenSlot, 2, r7, int32(s.cmdLen))
-	if s.inline {
-		read(scsiCDBSlot, 16, r7, int32(s.cmd))
-	} else {
-		// a command of 16 bytes or fewer sits in the issuer's own bytes
-		// (scsi_req_init points cmd there and only a longer one is moved),
-		// so a pointer anywhere else is a longer command or a layout that is
-		// not what the type information says, and counts
-		read(scsiPtrSlot, 8, r7, int32(s.cmd))
-		a.emit(ldx(bpfSizeDW, r8, r10, scsiPtrSlot))
-		a.emit(movReg(r9, r7))
-		a.emit(addImm(r9, int32(s.own)))
-		a.jump(bpfJNE|bpfSrcX, r8, r9, 0, "scsiother")
-		read(scsiCDBSlot, 16, r8, 0)
-	}
-	a.emit(ldx(bpfSizeH, r8, r10, scsiCmdLenSlot)) // r8 = the command's length
-	a.emit(ldx(bpfSizeB, r9, r10, scsiCDBSlot))    // r9 = its opcode
-	a.emit(ldx(bpfSizeW, r7, r6, dataLenOff))      // r7 = the bytes it moves
-	for i, r := range markSCSIRules {
-		next := fmt.Sprintf("scsirule%d", i+1)
-		if i == len(markSCSIRules)-1 {
-			next = "scsiother"
-		}
-		a.label(fmt.Sprintf("scsirule%d", i))
-		a.jump(bpfJNE|bpfSrcK, r9, 0, int32(r.op), next)
-		a.jump(bpfJNE|bpfSrcK, r8, 0, int32(r.len), next)
-		if r.dataIn {
-			a.jump(bpfJEQ|bpfSrcK, r7, 0, 0, next)
-		} else {
-			a.jump(bpfJNE|bpfSrcK, r7, 0, 0, next)
-		}
-		for _, t := range r.tests {
-			a.emit(ldx(bpfSizeB, r1, r10, scsiCDBSlot+int16(t.at)))
-			if t.mask != 0xff {
-				a.emit(andImm(r1, int32(t.mask)))
-			}
-			a.jump(bpfJNE|bpfSrcK, r1, 0, int32(t.val), next)
-		}
-		a.jump(bpfJA, 0, 0, 0, "exit")
-	}
-	a.label("scsiother")
 }
 
 // the operations a mark program lets through as reads. anything on the disk
@@ -524,9 +365,9 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift, foldShift uint, regi
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "ranges")
 	}
 	// on an sd disk a read-direction passthrough (the code a no-data command
-	// takes too) carrying a command on markSCSIRules leaves as well. reads,
+	// takes too) carrying a command on scsiPassRules leaves as well. reads,
 	// writes and ranges have gone by now, so they run none of it
-	scsi := l.scsiQ.usable() && len(l.dataInOps) > 0
+	scsi := l.scsi.usable() && len(l.dataInOps) > 0
 	if scsi {
 		for _, op := range l.dataInOps {
 			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "scsiquery")
@@ -534,7 +375,7 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift, foldShift uint, regi
 	}
 	emitStat(a, statsMapFD, markStatPassthrough, "exit")
 	if scsi {
-		emitMarkSCSIPass(a, l.scsiQ, offs["data_len"])
+		emitSCSIRules(a, l.scsi, movReg(r7, r6), ldx(bpfSizeW, r7, r6, offs["data_len"]))
 		emitStat(a, statsMapFD, markStatPassthrough, "exit")
 	}
 

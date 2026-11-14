@@ -13,13 +13,22 @@ agent falls back to a full read. It reads the request structure directly, with
 field offsets taken from the running kernel's BTF, so it needs no kernel
 headers, no compiler on the host and no per-kernel build.
 
-On a SCSI disk (the `sd` driver) a completed command that moved no data is
-checked against a short list of commands that cannot change the media: TEST
-UNIT READY, and the ATA PASS-THROUGH non-data forms of SMART RETURN STATUS and
-CHECK POWER MODE. The program reads the command bytes with
-`bpf_probe_read_kernel`, and lets a command through only when every read
-succeeds and its opcode, length and fields match exactly. Every other
-zero-data command still counts as a possible change.
+A driver passthrough (a command sent through sg, bsg or the nvme ioctls) is
+counted as a possible change unless the disk's driver and the command prove it
+cannot change the media. On a SCSI disk (the `sd` driver on blk-mq) the
+programs read the command bytes with the kernel's probe read helper and let a
+command through only when every read succeeds and the command matches one
+entry of `scsiPassRules` exactly: its length, its data phase and every tested
+byte. The table holds read-only queries such as TEST UNIT READY, INQUIRY,
+READ CAPACITY, MODE SENSE, LOG SENSE, PERSISTENT RESERVE IN and the ATA
+PASS-THROUGH reads smartd and smartctl send (IDENTIFY, SMART READ DATA,
+THRESHOLDS and LOG, READ LOG EXT). A command is never let through because of
+how many bytes it moved, so a FORMAT UNIT, SANITIZE or WRITE SAME sent with a
+data-in buffer still counts. On virtio_blk the driver's own serial number
+query passes. On every other disk, and when the command cannot be read, every
+passthrough counts. On a queue with no disk only an nvme controller's admin
+query (Get Log Page, Identify, Get Features and the like, proven by the
+controller naming the queue as its admin queue) passes.
 
 On kernel 5.4, which has vmlinux BTF but no typed `block_rq_complete`
 tracepoint and no mmap-able maps, `buildTrackProgramClassic` emits a classic
@@ -33,9 +42,9 @@ region in one of two buffers; the agent switches buffers and waits for a
 while a cloud disk is replicated from snapshots. One program on
 `block_rq_issue` counts each write-class request's regions and records it as
 in flight; one on `block_rq_complete` removes it once it has completed in full.
-A request the programs cannot account for (a driver passthrough that may
-change data, a full map, a bio chain past its walk limit) moves a witness
-counter, and the agent then reads the whole disk.
+A request the programs cannot account for (a driver passthrough the same rules
+do not let through, a full map, a bio chain past its walk limit) moves a
+witness counter, and the agent then reads the whole disk.
 
 ## Licence
 

@@ -281,7 +281,9 @@ type trackLayout struct {
 	discardOps  []int32  // the subset the block layer may merge from separate ranges, marked from their bios
 	readOps     []int32  // REQ_OP_* values that never change data
 	dataInOps   []int32  // driver passthrough that moves data from the device (DRV_IN, SCSI_IN)
-	scsi        scsiPassLayout
+	drvInOps    []int32  // the DRV_IN subset, which passPolicy virtio lets through
+	pass        passPolicy
+	scsi        scsiCmdLayout // set only with pass == passSD
 	nvme        nvmeAdminLayout
 	// the kernel 5.4 mode: the program is attached by name with an untyped
 	// context, every read through a kernel pointer is a bpf_probe_read whose
@@ -290,24 +292,11 @@ type trackLayout struct {
 	classic bool
 }
 
-// where a scsi request's command bytes are, for letting the known-harmless
-// commands that move no data through (scsiPassFor). the zero value turns the
-// check off, and a disk that is not an sd disk on blk-mq always has it off
-type scsiPassLayout struct {
-	probeRead int32    // helper id of bpf_probe_read_kernel
-	pdu       uint32   // sizeof(struct request): blk-mq puts the driver's per-request data (struct scsi_cmnd on an sd queue) right after it
-	cmdLen    btfField // struct scsi_cmnd .cmd_len (u16)
-	cmnd      btfField // struct scsi_cmnd .cmnd
-	inline    bool     // cmnd holds the bytes (an array, from about 5.18), else it points to them
-}
-
-func (s scsiPassLayout) usable() bool { return s.probeRead != 0 }
-
 // where an nvme admin request's controller and command are, for letting the
 // queries an nvme controller's admin queue carries through (nvmeAdminFor).
 // the zero value turns the check off
 type nvmeAdminLayout struct {
-	probeRead  int32    // helper id of bpf_probe_read_kernel
+	probeRead  int32    // helper id: bpf_probe_read_kernel, or bpf_probe_read in the kernel 5.4 program
 	pdu        uint32   // sizeof(struct request): every nvme driver puts struct nvme_request first in the per-request data after it
 	reqCmd     btfField // struct nvme_request .cmd (pointer to struct nvme_command, whose first byte is the opcode)
 	reqCtrl    btfField // struct nvme_request .ctrl (pointer)
@@ -324,8 +313,8 @@ func (n nvmeAdminLayout) usable() bool { return n.probeRead != 0 }
 // Features with no data (5.5+), the driver keeps an event request
 // outstanding on every controller, and fabrics hosts send keep alive every
 // few seconds. none of them can change the media. every other admin
-// command (Format NVM, Sanitize, namespace management, vendor codes) is
-// judged as before
+// command (Format NVM, Sanitize, namespace management, vendor codes) counts,
+// whatever it moved
 var nvmeAdminQueryOps = []int32{0x02, 0x06, 0x08, 0x0a, 0x0c, 0x18}
 
 // stack slots for the nvme admin check, which runs on its own path
@@ -333,7 +322,6 @@ const (
 	nvmeQSlot   = -8  // the request's queue
 	nvmePtrSlot = -16 // the controller, then the command pointer
 	nvmeOpSlot  = -24 // the opcode, 1 byte
-	nvmeReqSlot = -32 // the request's operation, kept across the helper calls
 )
 
 // the operation codes that change what is on the disk. write-same is gone
@@ -349,31 +337,14 @@ var trackDiscardOpNames = map[string]bool{"REQ_OP_DISCARD": true, "REQ_OP_SECURE
 // SG_IO or the nvme ioctls, zone management, any code a newer kernel adds)
 // can change data at places the program cannot see, so it is counted as
 // overflow and the next pass reads in full. reads and flushes never change
-// data. a passthrough that moved data from the device is a query (INQUIRY,
-// the agent's own PERSISTENT RESERVE IN on every pass, smart and log pages)
-// and is let through; one that moved nothing may be FORMAT UNIT, SANITIZE,
-// WRITE SAME with no data-out buffer or an nvme write zeroes, so it counts.
-// the older kernels name the scsi forms of the same operations
+// data. a read-direction passthrough (the code a command with no data phase
+// takes too) is judged by the disk's passPolicy: on an sd disk only the
+// commands on scsiPassRules leave, whatever their length, since a FORMAT UNIT,
+// SANITIZE or WRITE SAME can be sent with a buffer from the device. the older
+// kernels name the scsi forms of the same operations
 var trackReadOpNames = []string{"REQ_OP_READ", "REQ_OP_FLUSH"}
 
 var trackDataInOpNames = []string{"REQ_OP_DRV_IN", "REQ_OP_SCSI_IN"}
-
-// the zero-data commands let through on an sd disk, matched exactly on their
-// command bytes: TEST UNIT READY (udev's re-probe, the kernel's own media
-// check, smartd on scsi and sas), and ATA PASS-THROUGH with the non-data
-// protocol carrying SMART RETURN STATUS or CHECK POWER MODE (smartd on sata).
-// none of them can change the media. every other command with no data phase
-// still counts, and so does any read of the command that fails
-const (
-	scsiTestUnitReady = 0x00
-	scsiATAPass16     = 0x85
-	scsiATAPass12     = 0xa1
-	ataProtoMask      = 0x1e // byte 1 bits 4:1
-	ataProtoNonData   = 0x06 // protocol 3
-	ataSMART          = 0xb0
-	ataSMARTStatus    = 0xda // the SMART feature RETURN STATUS
-	ataCheckPower     = 0xe5
-)
 
 // stack slots for the command check, below every other slot the program uses
 const (
@@ -466,16 +437,12 @@ func buildTrackProgramBanks(l trackLayout, dev uint32, shift uint, regions uint3
 	// gendisk, before it the device that owns the queue's backing_dev_info,
 	// whose devt is the disk's. anything on another disk leaves here. a queue
 	// with no disk is a controller's own: an nvme format or sanitize of this
-	// disk runs on the admin queue, so passthrough there is judged as if it
-	// were on this disk
-	nodisk := "passthrough"
-	if l.nvme.usable() {
-		nodisk = "nodisk"
-	}
+	// disk runs on the admin queue, so passthrough there counts unless it is
+	// a proven nvme admin query
 	a.emit(ldx(bpfSizeDW, r9, r2, offs["q"]))
 	if l.qDisk.size != 0 {
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["q_disk"]))
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, nodisk)
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nodisk")
 		a.emit(ldx(bpfSizeW, r0, r9, offs["major"]))
 		a.emit(lshImm(r0, 20))
 		a.emit(ldx(bpfSizeW, r1, r9, offs["first_minor"]))
@@ -483,52 +450,14 @@ func buildTrackProgramBanks(l trackLayout, dev uint32, shift uint, regions uint3
 	} else {
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["q_bdi"]))
 		a.emit(ldx(bpfSizeDW, r9, r9, offs["bdi_owner"]))
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, nodisk)
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nodisk")
 		a.emit(ldx(bpfSizeW, r0, r9, offs["devt"]))
 	}
 	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), "exit")
 	for _, op := range l.writeOps {
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "write")
 	}
-	// passthrough on the disk's own queue, whose per-request data is the
-	// disk driver's: an sd disk's zero-data commands are checked against the
-	// list. the request is reloaded from the context because r1-r3 become
-	// the probe read's arguments
-	if l.scsi.usable() && len(l.dataInOps) > 0 {
-		for _, op := range l.dataInOps {
-			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "scsidatain")
-		}
-		a.jump(bpfJA, 0, 0, 0, "overflow")
-	}
-	// a queue with no disk first meets the nvme admin check, which lets the
-	// controller's queries through; the disk's own passthrough skips it
-	if l.nvme.usable() {
-		if !(l.scsi.usable() && len(l.dataInOps) > 0) {
-			a.jump(bpfJA, 0, 0, 0, "passthrough")
-		}
-		a.label("nodisk")
-		// r3 is the operation and the check's helper calls clobber it
-		a.emit(stx(bpfSizeDW, r10, r3, nvmeReqSlot))
-		emitNVMeAdminPass(a, l.nvme, offs["q"], ldx(bpfSizeDW, r7, r6, 0))
-		a.emit(ldx(bpfSizeDW, r3, r10, nvmeReqSlot))
-	}
-	a.label("passthrough")
-	for _, op := range l.dataInOps {
-		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "datain")
-	}
-	a.jump(bpfJA, 0, 0, 0, "overflow")
-	// the verifier refuses unreachable code, so the block exists only when a
-	// data-in code jumps to it. nr_bytes is the length of the buffer the issuer
-	// declared, zero for a command with no data phase
-	if len(l.dataInOps) > 0 {
-		a.label("datain")
-		a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
-		a.jump(bpfJEQ|bpfSrcK, r4, 0, 0, "overflow")
-		a.jump(bpfJA, 0, 0, 0, "exit")
-		if l.scsi.usable() {
-			emitSCSIPass(a, l.scsi)
-		}
-	}
+	emitTrackPassthrough(a, l, offs["q"])
 
 	a.label("write")
 	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
@@ -677,79 +606,70 @@ func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32,
 	emitTrackOverflow(a, "fold", statsMapFD, bank)
 }
 
-// the scsidatain block: a data-in passthrough on an sd
-// disk's own queue. one that moved data leaves as datain does; one that moved
-// none leaves only when its command is on the list, read from the request's
-// struct scsi_cmnd with bpf_probe_read_kernel, since the verifier bounds btf
-// loads to struct request. a failed read zero-fills its buffer and zero is
-// TEST UNIT READY's opcode, so every read's result is checked and the length
-// must match the command exactly. clobbers r0-r5 and r7-r9
-func emitSCSIPass(a *bpfAsm, s scsiPassLayout) {
-	a.label("scsidatain")
-	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
-	a.jump(bpfJNE|bpfSrcK, r4, 0, 0, "exit")
-	a.emit(ldx(bpfSizeDW, r7, r6, 0)) // r7 = rq
-	a.emit(addImm(r7, int32(s.pdu)))  // r7 = the struct scsi_cmnd after it
-	read := func(slot int16, size int32, src uint8, off int32) {
-		a.emit(movReg(r1, r10))
-		a.emit(addImm(r1, int32(slot)))
-		a.emit(movImm(r2, size))
-		a.emit(movReg(r3, src))
-		a.emit(addImm(r3, off))
-		a.emit(callHelper(s.probeRead))
-		a.jump(bpfJNE|bpfSrcK, r0, 0, 0, "overflow")
-	}
-	read(scsiCmdLenSlot, 2, r7, int32(s.cmdLen.off))
-	if s.inline {
-		read(scsiCDBSlot, 16, r7, int32(s.cmnd.off))
-	} else {
-		read(scsiPtrSlot, 8, r7, int32(s.cmnd.off))
-		a.emit(ldx(bpfSizeDW, r8, r10, scsiPtrSlot))
-		a.jump(bpfJEQ|bpfSrcK, r8, 0, 0, "overflow")
-		read(scsiCDBSlot, 16, r8, 0)
-	}
-	a.emit(ldx(bpfSizeH, r8, r10, scsiCmdLenSlot)) // r8 = cmd_len
-	cdb := func(dst uint8, i int16) { a.emit(ldx(bpfSizeB, dst, r10, scsiCDBSlot+i)) }
-	cdb(r9, 0) // r9 = opcode
-	a.jump(bpfJEQ|bpfSrcK, r9, 0, scsiATAPass16, "ata16")
-	a.jump(bpfJEQ|bpfSrcK, r9, 0, scsiATAPass12, "ata12")
-	a.jump(bpfJNE|bpfSrcK, r9, 0, scsiTestUnitReady, "overflow")
-	a.jump(bpfJNE|bpfSrcK, r8, 0, 6, "overflow")
-	a.jump(bpfJA, 0, 0, 0, "exit")
-	// an ata pass-through: the length, the non-data protocol, then the ata
-	// command and feature at the places each form keeps them
-	ata := func(p string, n int32, cmd, featLo, featHi int16) {
-		a.label(p)
-		a.jump(bpfJNE|bpfSrcK, r8, 0, n, "overflow")
-		cdb(r9, 1)
-		a.emit(andImm(r9, ataProtoMask))
-		a.jump(bpfJNE|bpfSrcK, r9, 0, ataProtoNonData, "overflow")
-		cdb(r9, cmd)
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, ataCheckPower, "exit")
-		a.jump(bpfJNE|bpfSrcK, r9, 0, ataSMART, "overflow")
-		cdb(r9, featLo)
-		a.jump(bpfJNE|bpfSrcK, r9, 0, ataSMARTStatus, "overflow")
-		if featHi >= 0 {
-			cdb(r9, featHi)
-			a.jump(bpfJNE|bpfSrcK, r9, 0, 0, "overflow")
+// the passthrough blocks of both completion programs, for a request that is
+// no read and no write: r3 is its operation on the disk's own queue, and a
+// queue with no disk jumps to nodisk. on the disk's queue the disk's
+// passPolicy decides (passFor): an sd disk's DRV_IN and SCSI_IN go to the
+// command check, virtio_blk's DRV_IN leaves, and everything else counts. on
+// a queue with no disk only a proven nvme admin query leaves. nothing leaves
+// by the bytes it moved. the request is reloaded from the context, since
+// r1-r5 are the helper calls' arguments
+func emitTrackPassthrough(a *bpfAsm, l trackLayout, qOff int16) {
+	pass := l.passFor()
+	switch pass {
+	case passSD:
+		for _, op := range l.dataInOps {
+			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "scsiquery")
 		}
-		a.jump(bpfJA, 0, 0, 0, "exit")
+	case passVirtio:
+		for _, op := range l.drvInOps {
+			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "exit")
+		}
 	}
-	ata("ata16", 16, 14, 4, 3)
-	ata("ata12", 12, 9, 3, -1)
+	a.jump(bpfJA, 0, 0, 0, "overflow")
+	a.label("nodisk")
+	if l.nvme.usable() {
+		emitNVMeAdminPass(a, l.nvme, qOff, ldx(bpfSizeDW, r7, r6, 0))
+	}
+	a.jump(bpfJA, 0, 0, 0, "overflow")
+	if pass == passSD {
+		emitSCSIRules(a, l.scsi, ldx(bpfSizeDW, r7, r6, 0), ldx(bpfSizeDW, r7, r6, 16))
+		a.jump(bpfJA, 0, 0, 0, "overflow")
+	}
+}
+
+// the policy the program is built with: an sd disk whose command cannot be
+// read, or a kernel with no data-in operation for the check to take, counts
+func (l trackLayout) passFor() passPolicy {
+	if l.pass == passSD && !(l.scsi.usable() && len(l.dataInOps) > 0) {
+		return passCount
+	}
+	return l.pass
+}
+
+// the layout with the scsi and nvme command checks off, for a kernel that
+// refuses the program carrying them: an sd disk then counts every passthrough
+// as passCount does, and virtio_blk, whose rule needs no read, keeps it
+func trackLayoutWithoutChecks(l trackLayout) trackLayout {
+	l.scsi, l.nvme = scsiCmdLayout{}, nvmeAdminLayout{}
+	if l.pass == passSD {
+		l.pass = passCount
+	}
+	return l
 }
 
 // a passthrough on a queue with no disk that is an nvme controller's admin
 // queue and carries one of nvmeAdminQueryOps leaves for exit. anything else,
 // including any probe read that fails, falls through to nvmeother at the
-// end of the block, where the caller judges it as before. the request is an
+// end of the block, where the caller counts it. the request is an
 // nvme admin request only when the controller its struct nvme_request names
 // has this queue as its admin queue and its admin tag set is the queue's tag
 // set. either test alone could pass by chance on another driver's
 // per-request data (a scsi_cmnd points at a scsi_device that names its own
 // queue), so both must hold. loadRq puts the request in r7 (the completion
-// program reads it from its context, the mark issue program copies it from
-// r6). clobbers r0-r5 and r7-r9
+// programs read it from their context, the mark issue program copies it
+// from r6). the layout's helper is bpf_probe_read in the kernel 5.4
+// program. clobbers r0-r5 and r7-r9
 func emitNVMeAdminPass(a *bpfAsm, n nvmeAdminLayout, qOff int16, loadRq bpfInsn) {
 	read := func(slot int16, size int32, src uint8, off int32) {
 		a.emit(movReg(r1, r10))
@@ -1098,6 +1018,9 @@ func buildTrackProgramClassic(l trackLayout, dev uint32, shift uint, regions uin
 	if l.scsi.usable() && l.scsi.probeRead != bpfFuncProbeRead {
 		return nil, fmt.Errorf("the kernel 5.4 command check calls helper %d, not bpf_probe_read", l.scsi.probeRead)
 	}
+	if l.nvme.usable() && l.nvme.probeRead != bpfFuncProbeRead {
+		return nil, fmt.Errorf("the kernel 5.4 nvme admin check calls helper %d, not bpf_probe_read", l.nvme.probeRead)
+	}
 	bases, cells := trackLevels(regions)
 	chunks := trackFlagChunks(cells)
 	ovKey, ovByte := trackFlagAt(cells)
@@ -1133,7 +1056,7 @@ func buildTrackProgramClassic(l trackLayout, dev uint32, shift uint, regions uin
 	probe(a, r9, bpfSizeDW, r9, offs["q"], "overflow")
 	if l.qDisk.size != 0 {
 		probe(a, r9, bpfSizeDW, r9, offs["q_disk"], "overflow")
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nodisk")
 		probe(a, r8, bpfSizeW, r9, offs["major"], "overflow")
 		a.emit(lshImm(r8, 20))
 		probe(a, r0, bpfSizeW, r9, offs["first_minor"], "overflow")
@@ -1141,9 +1064,9 @@ func buildTrackProgramClassic(l trackLayout, dev uint32, shift uint, regions uin
 	} else {
 		probe(a, r9, bpfSizeDW, r9, offs["q_bdi"], "overflow")
 		// a queue with no bdi has no owner, as the btf program reads it
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nodisk")
 		probe(a, r9, bpfSizeDW, r9, offs["bdi_owner"], "overflow")
-		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "passthrough")
+		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nodisk")
 		probe(a, r0, bpfSizeW, r9, offs["devt"], "overflow")
 	}
 	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), "exit")
@@ -1151,27 +1074,7 @@ func buildTrackProgramClassic(l trackLayout, dev uint32, shift uint, regions uin
 	for _, op := range l.writeOps {
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "write")
 	}
-	if l.scsi.usable() && len(l.dataInOps) > 0 {
-		for _, op := range l.dataInOps {
-			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "scsidatain")
-		}
-		a.jump(bpfJA, 0, 0, 0, "overflow")
-	}
-	a.label("passthrough")
-	a.emit(ldx(bpfSizeDW, r3, r10, classicOpSlot))
-	for _, op := range l.dataInOps {
-		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "datain")
-	}
-	a.jump(bpfJA, 0, 0, 0, "overflow")
-	if len(l.dataInOps) > 0 {
-		a.label("datain")
-		a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
-		a.jump(bpfJEQ|bpfSrcK, r4, 0, 0, "overflow")
-		a.jump(bpfJA, 0, 0, 0, "exit")
-		if l.scsi.usable() {
-			emitSCSIPass(a, l.scsi)
-		}
-	}
+	emitTrackPassthrough(a, l, offs["q"])
 
 	a.label("write")
 	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
@@ -1330,4 +1233,225 @@ func emitFlagOverflow(a *bpfAsm, p string, flagMapFD int, ovKey, ovByte uint32) 
 	a.label(p + "exit")
 	a.emit(movImm(r0, 0))
 	a.emit(exitInsn())
+}
+
+// where an sd request's command is, for letting the queries on scsiPassRules
+// through. one layout serves every program: the mark issue program at
+// block_rq_issue, and the completion programs at block_rq_complete, where the
+// issuer's bytes are still in place (scsi_init_command clears only what
+// follows the issuer's struct scsi_request, and before 5.18 the scsi layer
+// points scsi_cmnd.cmnd at the request's command without writing the request
+// itself). the zero value turns the check off, and a disk that is not an sd
+// disk on blk-mq always has it off. struct scsi_cmnd's own cmnd and cmd_len
+// cannot be used before 5.18: on 4.18 the scsi layer clears them, starts the
+// request (the issue tracepoint) and only then points them at the command, so
+// the issuer's struct scsi_request (scsi_cmnd's first member there, which the
+// clear leaves) is read instead. from 5.18 the issuer writes the bytes into
+// scsi_cmnd.cmnd itself
+type scsiCmdLayout struct {
+	probeRead int32  // helper id: bpf_probe_read_kernel, or bpf_probe_read in the kernel 5.4 program
+	pdu       uint32 // sizeof(struct request): the struct scsi_cmnd after it
+	cmdLen    uint32 // offset in struct scsi_cmnd of the command length (u16)
+	cmd       uint32 // offset in struct scsi_cmnd of the command bytes, or of the pointer to them
+	inline    bool   // cmd holds the bytes (5.18+), else it points to them
+	own       uint32 // pointer form: offset in struct scsi_cmnd of the issuer's own 16 command bytes
+}
+
+func (s scsiCmdLayout) usable() bool { return s.probeRead != 0 }
+
+// one command a program lets through on an sd disk: its opcode, its exact
+// length, whether it moves data from the device or none, and the bytes that
+// must hold the given value under the mask
+type scsiPassRule struct {
+	name   string
+	op     uint8
+	len    uint8
+	dataIn bool
+	tests  []scsiPassByte
+}
+
+type scsiPassByte struct{ at, mask, val uint8 }
+
+// the ata pass-through fields the rules test. the protocol is byte 1 bits
+// 4:1 of both forms
+const (
+	ataProtoMask    = 0x1e
+	ataProtoNonData = 0x06 // protocol 3
+	ataProtoPIOIn   = 0x08 // protocol 4, pio data-in
+	ataSMART        = 0xb0
+	ataSMARTStatus  = 0xda // SMART RETURN STATUS
+	ataSMARTData    = 0xd0 // SMART READ DATA
+	ataSMARTThresh  = 0xd1 // SMART READ ATTRIBUTE THRESHOLDS
+	ataSMARTLog     = 0xd5 // SMART READ LOG
+	ataSMARTLBAMid  = 0x4f // the signature every SMART command carries in lba mid and high
+	ataSMARTLBAHigh = 0xc2
+	ataCheckPower   = 0xe5
+	ataIdentify     = 0xec
+	ataIdentifyPkt  = 0xa1
+	ataReadLogExt   = 0x2f
+)
+
+// the 16 byte form keeps the command in byte 14, the low feature in byte 4
+// with the high one in byte 3, and lba mid and high in bytes 10 and 12. the
+// 12 byte form keeps them in bytes 9, 3, 6 and 7
+func ata16(proto, cmd uint8, more ...scsiPassByte) []scsiPassByte {
+	return append([]scsiPassByte{{1, ataProtoMask, proto}, {14, 0xff, cmd}}, more...)
+}
+
+func ata12(proto, cmd uint8, more ...scsiPassByte) []scsiPassByte {
+	return append([]scsiPassByte{{1, ataProtoMask, proto}, {9, 0xff, cmd}}, more...)
+}
+
+func smart16(feature uint8) []scsiPassByte {
+	return ata16(ataProtoPIOIn, ataSMART, scsiPassByte{4, 0xff, feature}, scsiPassByte{3, 0xff, 0}, scsiPassByte{10, 0xff, ataSMARTLBAMid}, scsiPassByte{12, 0xff, ataSMARTLBAHigh})
+}
+
+func smart12(feature uint8) []scsiPassByte {
+	return ata12(ataProtoPIOIn, ataSMART, scsiPassByte{3, 0xff, feature}, scsiPassByte{6, 0xff, ataSMARTLBAMid}, scsiPassByte{7, 0xff, ataSMARTLBAHigh})
+}
+
+// the commands that cannot change the media, matched exactly. the ones with
+// no data phase are TEST UNIT READY (udev's re-probe, multipathd's tur
+// checker, smartd) and ATA PASS-THROUGH with the non-data protocol carrying
+// CHECK POWER MODE or SMART RETURN STATUS (smartd on sata). the ones that
+// move data from the device are the queries udev's scsi_id, smartctl, smartd,
+// sg_inq, sg_readcap and the kernel's own revalidation send (captured on
+// compute engine kernels 4.18 to 7.0), READ for multipathd's readsector0
+// checker, and the ata reads smartd and smartctl send through ATA
+// PASS-THROUGH on a sata disk (IDENTIFY, SMART READ DATA, READ THRESHOLDS and
+// READ LOG, READ LOG EXT) under the pio data-in protocol only. the data phase
+// must match: a FORMAT UNIT, SANITIZE or WRITE SAME sent with a buffer from
+// the device still counts, as does any command off the list (SMART WRITE
+// LOG and the SCT commands written through it, EXECUTE OFFLINE, SECURITY
+// ERASE, DOWNLOAD MICROCODE, DATA SET MANAGEMENT), any other protocol, any
+// length but the one given and any read of the command that fails
+var scsiPassRules = []scsiPassRule{
+	{name: "test unit ready", op: 0x00, len: 6},
+	{name: "ata pass-through(16) check power mode", op: 0x85, len: 16, tests: ata16(ataProtoNonData, ataCheckPower)},
+	{name: "ata pass-through(16) smart return status", op: 0x85, len: 16, tests: ata16(ataProtoNonData, ataSMART, scsiPassByte{4, 0xff, ataSMARTStatus}, scsiPassByte{3, 0xff, 0})},
+	{name: "ata pass-through(12) check power mode", op: 0xa1, len: 12, tests: ata12(ataProtoNonData, ataCheckPower)},
+	{name: "ata pass-through(12) smart return status", op: 0xa1, len: 12, tests: ata12(ataProtoNonData, ataSMART, scsiPassByte{3, 0xff, ataSMARTStatus})},
+	{name: "inquiry", op: 0x12, len: 6, dataIn: true},
+	{name: "request sense", op: 0x03, len: 6, dataIn: true},
+	{name: "mode sense(6)", op: 0x1a, len: 6, dataIn: true},
+	{name: "mode sense(10)", op: 0x5a, len: 10, dataIn: true},
+	{name: "read capacity(10)", op: 0x25, len: 10, dataIn: true},
+	{name: "read capacity(16)", op: 0x9e, len: 16, dataIn: true, tests: []scsiPassByte{{1, 0x1f, 0x10}}},
+	{name: "get lba status", op: 0x9e, len: 16, dataIn: true, tests: []scsiPassByte{{1, 0x1f, 0x12}}},
+	{name: "persistent reserve in", op: 0x5e, len: 10, dataIn: true},
+	{name: "report luns", op: 0xa0, len: 12, dataIn: true},
+	{name: "log sense", op: 0x4d, len: 10, dataIn: true},
+	{name: "receive diagnostic results", op: 0x1c, len: 6, dataIn: true},
+	{name: "report target port groups", op: 0xa3, len: 12, dataIn: true, tests: []scsiPassByte{{1, 0x1f, 0x0a}}},
+	{name: "report supported operation codes", op: 0xa3, len: 12, dataIn: true, tests: []scsiPassByte{{1, 0x1f, 0x0c}}},
+	{name: "report supported task management functions", op: 0xa3, len: 12, dataIn: true, tests: []scsiPassByte{{1, 0x1f, 0x0d}}},
+	{name: "read defect data(10)", op: 0x37, len: 10, dataIn: true},
+	{name: "read defect data(12)", op: 0xb7, len: 12, dataIn: true},
+	{name: "read(10)", op: 0x28, len: 10, dataIn: true},
+	{name: "read(16)", op: 0x88, len: 16, dataIn: true},
+	{name: "ata pass-through(16) identify device", op: 0x85, len: 16, dataIn: true, tests: ata16(ataProtoPIOIn, ataIdentify)},
+	{name: "ata pass-through(16) identify packet device", op: 0x85, len: 16, dataIn: true, tests: ata16(ataProtoPIOIn, ataIdentifyPkt)},
+	{name: "ata pass-through(16) smart read data", op: 0x85, len: 16, dataIn: true, tests: smart16(ataSMARTData)},
+	{name: "ata pass-through(16) smart read thresholds", op: 0x85, len: 16, dataIn: true, tests: smart16(ataSMARTThresh)},
+	{name: "ata pass-through(16) smart read log", op: 0x85, len: 16, dataIn: true, tests: smart16(ataSMARTLog)},
+	{name: "ata pass-through(16) read log ext", op: 0x85, len: 16, dataIn: true, tests: ata16(ataProtoPIOIn, ataReadLogExt)},
+	{name: "ata pass-through(12) identify device", op: 0xa1, len: 12, dataIn: true, tests: ata12(ataProtoPIOIn, ataIdentify)},
+	{name: "ata pass-through(12) identify packet device", op: 0xa1, len: 12, dataIn: true, tests: ata12(ataProtoPIOIn, ataIdentifyPkt)},
+	{name: "ata pass-through(12) smart read data", op: 0xa1, len: 12, dataIn: true, tests: smart12(ataSMARTData)},
+	{name: "ata pass-through(12) smart read thresholds", op: 0xa1, len: 12, dataIn: true, tests: smart12(ataSMARTThresh)},
+	{name: "ata pass-through(12) smart read log", op: 0xa1, len: 12, dataIn: true, tests: smart12(ataSMARTLog)},
+}
+
+// whether a command is let through: the table every program is built from,
+// applied in go by the blktrace mode to the command bytes el7 records with
+// each passthrough completion
+func scsiPassAllowed(cdb []byte, cmdLen int, dataIn bool) bool {
+	if len(cdb) == 0 {
+		return false
+	}
+	for _, r := range scsiPassRules {
+		if cdb[0] != r.op || cmdLen != int(r.len) || dataIn != r.dataIn {
+			continue
+		}
+		ok := true
+		for _, t := range r.tests {
+			if int(t.at) >= len(cdb) || cdb[t.at]&t.mask != t.val {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// the scsiquery block: a data-in passthrough on an sd disk's own queue whose
+// command is on scsiPassRules leaves for exit; anything else, and any read of
+// the command that fails, falls through to scsiother at the end of the block,
+// where the caller counts it. loadRq puts the request in r7 and loadLen the
+// bytes the command moves in r7, from r6, which the helper calls leave: the
+// mark issue program reads __data_len, the completion programs the completed
+// byte count of their context, which for a passthrough is the length the
+// issuer declared. the command is read with the layout's probe read helper,
+// since the verifier bounds btf loads to struct request. a failed read
+// zero-fills its buffer and zero is TEST UNIT READY's opcode, so every read's
+// result is checked and the length must match a rule exactly. uses the
+// command check's stack slots, which nothing on the callers' paths to it has
+// written. clobbers r0-r5 and r7-r9
+func emitSCSIRules(a *bpfAsm, s scsiCmdLayout, loadRq, loadLen bpfInsn) {
+	a.label("scsiquery")
+	a.emit(loadRq)
+	a.emit(addImm(r7, int32(s.pdu))) // r7 = the struct scsi_cmnd after it
+	read := func(slot int16, size int32, src uint8, off int32) {
+		a.emit(movReg(r1, r10))
+		a.emit(addImm(r1, int32(slot)))
+		a.emit(movImm(r2, size))
+		a.emit(movReg(r3, src))
+		a.emit(addImm(r3, off))
+		a.emit(callHelper(s.probeRead))
+		a.jump(bpfJNE|bpfSrcK, r0, 0, 0, "scsiother")
+	}
+	read(scsiCmdLenSlot, 2, r7, int32(s.cmdLen))
+	if s.inline {
+		read(scsiCDBSlot, 16, r7, int32(s.cmd))
+	} else {
+		// a command of 16 bytes or fewer sits in the issuer's own bytes
+		// (scsi_req_init points cmd there and only a longer one is moved),
+		// so a pointer anywhere else is a longer command or a layout that is
+		// not what the type information says, and counts
+		read(scsiPtrSlot, 8, r7, int32(s.cmd))
+		a.emit(ldx(bpfSizeDW, r8, r10, scsiPtrSlot))
+		a.emit(movReg(r9, r7))
+		a.emit(addImm(r9, int32(s.own)))
+		a.jump(bpfJNE|bpfSrcX, r8, r9, 0, "scsiother")
+		read(scsiCDBSlot, 16, r8, 0)
+	}
+	a.emit(ldx(bpfSizeH, r8, r10, scsiCmdLenSlot)) // r8 = the command's length
+	a.emit(ldx(bpfSizeB, r9, r10, scsiCDBSlot))    // r9 = its opcode
+	a.emit(loadLen)                                // r7 = the bytes it moves
+	for i, r := range scsiPassRules {
+		next := fmt.Sprintf("scsirule%d", i+1)
+		if i == len(scsiPassRules)-1 {
+			next = "scsiother"
+		}
+		a.label(fmt.Sprintf("scsirule%d", i))
+		a.jump(bpfJNE|bpfSrcK, r9, 0, int32(r.op), next)
+		a.jump(bpfJNE|bpfSrcK, r8, 0, int32(r.len), next)
+		if r.dataIn {
+			a.jump(bpfJEQ|bpfSrcK, r7, 0, 0, next)
+		} else {
+			a.jump(bpfJNE|bpfSrcK, r7, 0, 0, next)
+		}
+		for _, t := range r.tests {
+			a.emit(ldx(bpfSizeB, r1, r10, scsiCDBSlot+int16(t.at)))
+			if t.mask != 0xff {
+				a.emit(andImm(r1, int32(t.mask)))
+			}
+			a.jump(bpfJNE|bpfSrcK, r1, 0, int32(t.val), next)
+		}
+		a.jump(bpfJA, 0, 0, 0, "exit")
+	}
+	a.label("scsiother")
 }
