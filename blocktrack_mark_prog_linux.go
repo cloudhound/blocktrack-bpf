@@ -352,7 +352,7 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift, foldShift uint, regi
 	// which carries format and sanitize) can still change this disk's data,
 	// so anything but a read or a proven nvme admin query there moves the
 	// witness
-	emitDiskMatch(a, l.trackLayout, offs, r6, dev, "exit", "nodisk")
+	emitDiskMatch(a, l.trackLayout, offs, r6, dev, otherDisk(l.trackLayout), "nodisk")
 	a.emit(ldx(bpfSizeW, r3, r6, offs["cmd_flags"]))
 	a.emit(andImm(r3, reqOpMask))
 	for _, op := range l.readOps {
@@ -489,6 +489,15 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift, foldShift uint, regi
 		emitNVMeAdminPass(a, l.nvme, offs["q"], movReg(r7, r6))
 	}
 	emitStat(a, statsMapFD, markStatPassthrough, "exit")
+
+	// a passthrough on another nvme namespace's queue naming this one. the
+	// command is set when the request is allocated, before it is issued
+	if l.sibling.on {
+		leave := append(append(append([]int32{}, l.readOps...), l.plainOps...), l.rangeOps...)
+		emitNVMeSiblingPass(a, l.sibling, l.nvme, dev, []bpfInsn{ldx(bpfSizeW, r3, r6, offs["cmd_flags"]), andImm(r3, reqOpMask)}, leave, movReg(r7, r6), "exit", "sibcount")
+		a.label("sibcount")
+		emitStat(a, statsMapFD, markStatPassthrough, "exit")
+	}
 
 	a.label("exit")
 	a.emit(movImm(r0, 0))

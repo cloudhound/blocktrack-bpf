@@ -285,6 +285,7 @@ type trackLayout struct {
 	pass        passPolicy
 	scsi        scsiCmdLayout // set only with pass == passSD
 	nvme        nvmeAdminLayout
+	sibling     nvmeSibling // set only on an nvme namespace (nvmeSiblingAt)
 	// the kernel 5.4 mode: the program is attached by name with an untyped
 	// context, every read through a kernel pointer is a bpf_probe_read whose
 	// result is checked, and it marks one-byte dirty flags
@@ -306,6 +307,20 @@ type nvmeAdminLayout struct {
 }
 
 func (n nvmeAdminLayout) usable() bool { return n.probeRead != 0 }
+
+// an nvme namespace's check of passthrough on another namespace's queue.
+// before 5.15 the nvme ioctls send the command's own nsid to the controller
+// whichever namespace node it came through, so an io passthrough through
+// nvme0n2 naming nsid 3 changes nvme0n3 on nvme0n2's queue. the zero value
+// turns the check off, which leaves every program of a disk that is no nvme
+// namespace as it was
+type nvmeSibling struct {
+	on   bool
+	nsid uint32 // this namespace's id, 0 when it could not be read
+}
+
+// stack slot for the sibling check's nsid, 4 bytes
+const nvmeNSIDSlot = -24
 
 // the admin opcodes let through on an nvme controller's admin queue: Get Log
 // Page, Identify, Abort, Get Features, Asynchronous Event Request and Keep
@@ -435,7 +450,9 @@ func buildTrackProgramBanks(l trackLayout, dev uint32, shift uint, regions uint3
 	// request names: before 5.16 sg and bsg send a passthrough to this disk's
 	// queue naming the sg node's disk or none. from 5.15 that is the queue's
 	// gendisk, before it the device that owns the queue's backing_dev_info,
-	// whose devt is the disk's. anything on another disk leaves here. a queue
+	// whose devt is the disk's. anything on another disk leaves here, except
+	// on an nvme namespace, where a non read/write request on a sibling's
+	// queue is judged at otherdisk (emitNVMeSiblingPass). a queue
 	// with no disk is a controller's own: an nvme format or sanitize of this
 	// disk runs on the admin queue, so passthrough there counts unless it is
 	// a proven nvme admin query
@@ -453,11 +470,14 @@ func buildTrackProgramBanks(l trackLayout, dev uint32, shift uint, regions uint3
 		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nodisk")
 		a.emit(ldx(bpfSizeW, r0, r9, offs["devt"]))
 	}
-	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), "exit")
+	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), otherDisk(l))
 	for _, op := range l.writeOps {
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "write")
 	}
 	emitTrackPassthrough(a, l, offs["q"])
+	if l.sibling.on {
+		emitNVMeSiblingPass(a, l.sibling, l.nvme, dev, nil, l.writeOps, ldx(bpfSizeDW, r7, r6, 0), "exit", "overflow")
+	}
 
 	a.label("write")
 	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
@@ -638,6 +658,15 @@ func emitTrackPassthrough(a *bpfAsm, l trackLayout, qOff int16) {
 	}
 }
 
+// where a request on another disk's queue goes: an nvme namespace judges it
+// at otherdisk (emitNVMeSiblingPass), every other disk leaves
+func otherDisk(l trackLayout) string {
+	if l.sibling.on {
+		return "otherdisk"
+	}
+	return "exit"
+}
+
 // the policy the program is built with: an sd disk whose command cannot be
 // read, or a kernel with no data-in operation for the check to take, counts
 func (l trackLayout) passFor() passPolicy {
@@ -672,13 +701,7 @@ func trackLayoutWithoutChecks(l trackLayout) trackLayout {
 // program. clobbers r0-r5 and r7-r9
 func emitNVMeAdminPass(a *bpfAsm, n nvmeAdminLayout, qOff int16, loadRq bpfInsn) {
 	read := func(slot int16, size int32, src uint8, off int32) {
-		a.emit(movReg(r1, r10))
-		a.emit(addImm(r1, int32(slot)))
-		a.emit(movImm(r2, size))
-		a.emit(movReg(r3, src))
-		a.emit(addImm(r3, off))
-		a.emit(callHelper(n.probeRead))
-		a.jump(bpfJNE|bpfSrcK, r0, 0, 0, "nvmeother")
+		emitProbeToSlot(a, n.probeRead, slot, size, src, off, "nvmeother")
 	}
 	a.emit(loadRq)
 	read(nvmeQSlot, 8, r7, int32(qOff))
@@ -706,6 +729,55 @@ func emitNVMeAdminPass(a *bpfAsm, n nvmeAdminLayout, qOff int16, loadRq bpfInsn)
 		a.jump(bpfJEQ|bpfSrcK, r8, 0, op, "exit")
 	}
 	a.label("nvmeother")
+}
+
+// copies size bytes at src+off to the stack slot with the probe read
+// helper, jumping to fail when the read fails. clobbers r0-r5
+func emitProbeToSlot(a *bpfAsm, helper int32, slot int16, size int32, src uint8, off int32, fail string) {
+	a.emit(movReg(r1, r10))
+	a.emit(addImm(r1, int32(slot)))
+	a.emit(movImm(r2, size))
+	a.emit(movReg(r3, src))
+	a.emit(addImm(r3, off))
+	a.emit(callHelper(helper))
+	a.jump(bpfJNE|bpfSrcK, r0, 0, 0, fail)
+}
+
+// the block at label otherdisk, where an nvme namespace's program goes for a
+// request on another disk's queue, with r0 that disk's device number (major
+// in the bits from 20 up). it leaves for leave unless the other disk has
+// this disk's major (every nvme namespace has the block extended major) and
+// the request is in none of leaveOps (loadOp puts its operation in r3
+// first). with the nvme layout and this namespace's nsid known, the nvme
+// command's nsid (bytes 4 to 7 of the command, the nvme spec's dword 1)
+// decides: this nsid, 0 or one with bit 31 set (0xffffffff is every
+// namespace) jumps to count, as does a null command or any read that fails,
+// and any other nsid leaves, since the controller runs a command on the
+// namespace it names. without either every such request jumps to count.
+// loadRq puts the request in r7. clobbers r0-r5, r7 and r8
+func emitNVMeSiblingPass(a *bpfAsm, s nvmeSibling, n nvmeAdminLayout, dev uint32, loadOp []bpfInsn, leaveOps []int32, loadRq bpfInsn, leave, count string) {
+	a.label("otherdisk")
+	a.emit(rshImm(r0, 20))
+	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev>>20), leave)
+	a.emit(loadOp...)
+	for _, op := range leaveOps {
+		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, leave)
+	}
+	if n.usable() && s.nsid != 0 && s.nsid < 1<<31 {
+		a.emit(loadRq)
+		a.emit(addImm(r7, int32(n.pdu))) // r7 = the struct nvme_request after it
+		emitProbeToSlot(a, n.probeRead, nvmePtrSlot, 8, r7, int32(n.reqCmd.off), count)
+		a.emit(ldx(bpfSizeDW, r8, r10, nvmePtrSlot)) // r8 = the command
+		a.jump(bpfJEQ|bpfSrcK, r8, 0, 0, count)
+		emitProbeToSlot(a, n.probeRead, nvmeNSIDSlot, 4, r8, 4, count)
+		a.emit(ldx(bpfSizeW, r8, r10, nvmeNSIDSlot)) // r8 = the command's nsid
+		a.jump(bpfJEQ|bpfSrcK, r8, 0, int32(s.nsid), count)
+		a.jump(bpfJEQ|bpfSrcK, r8, 0, 0, count)
+		a.jump(bpfJGT|bpfSrcK, r8, 0, 0x7fffffff, count)
+		a.jump(bpfJA, 0, 0, 0, leave)
+		return
+	}
+	a.jump(bpfJA, 0, 0, 0, count)
 }
 
 // counts a completion that could not be placed and ends the program, at
@@ -1069,12 +1141,15 @@ func buildTrackProgramClassic(l trackLayout, dev uint32, shift uint, regions uin
 		a.jump(bpfJEQ|bpfSrcK, r9, 0, 0, "nodisk")
 		probe(a, r0, bpfSizeW, r9, offs["devt"], "overflow")
 	}
-	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), "exit")
+	a.jump(bpfJNE|bpfSrcK, r0, 0, int32(dev), otherDisk(l))
 	a.emit(ldx(bpfSizeDW, r3, r10, classicOpSlot)) // r3 = op
 	for _, op := range l.writeOps {
 		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "write")
 	}
 	emitTrackPassthrough(a, l, offs["q"])
+	if l.sibling.on {
+		emitNVMeSiblingPass(a, l.sibling, l.nvme, dev, []bpfInsn{ldx(bpfSizeDW, r3, r10, classicOpSlot)}, l.writeOps, ldx(bpfSizeDW, r7, r6, 0), "exit", "overflow")
+	}
 
 	a.label("write")
 	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed
