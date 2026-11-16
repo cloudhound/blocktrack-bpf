@@ -428,7 +428,7 @@ func buildTrackProgram(l trackLayout, dev uint32, shift uint, regions uint32, re
 // cells; a wider one, and every discard range, sets the ladder cell of each
 // counter cell it counts
 func buildTrackProgramBanks(l trackLayout, dev uint32, shift uint, regions uint32, regionMapFD, statsMapFD int, bank *trackBankProg) ([]bpfInsn, error) {
-	if bank != nil && (bank.fshift < fineShift || bank.fshift > shift || shift-bank.fshift > trackBankMaxPerRegion) {
+	if bank != nil && (bank.fshift < minFineShift || bank.fshift >= shift || bank.fshift > trackBankFineShift(shift)) {
 		return nil, fmt.Errorf("fine cell shift %d does not fit regions of shift %d", bank.fshift, shift)
 	}
 	offs, err := trackProgramOffsets(l, dev, shift, regions)
