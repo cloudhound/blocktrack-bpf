@@ -431,6 +431,9 @@ func buildTrackProgramBanks(l trackLayout, dev uint32, shift uint, regions uint3
 	if bank != nil && (bank.fshift < minFineShift || bank.fshift >= shift || bank.fshift > trackBankFineShift(shift)) {
 		return nil, fmt.Errorf("fine cell shift %d does not fit regions of shift %d", bank.fshift, shift)
 	}
+	if bank != nil && bank.mshift != 0 && (bank.mshift != trackBankFineShift(shift) || bank.mshift <= bank.fshift || bank.mshift >= shift || bank.mid > bank.ladder) {
+		return nil, fmt.Errorf("mid cell shift %d does not fit fine cells of shift %d in regions of shift %d", bank.mshift, bank.fshift, shift)
+	}
 	offs, err := trackProgramOffsets(l, dev, shift, regions)
 	if err != nil {
 		return nil, err
@@ -970,9 +973,41 @@ func emitBankCell(a *bpfAsm, bank *trackBankProg, idx uint8, base uint32, skip b
 	}
 }
 
+// r2 = the cells of 1<<(cs+9) bytes from sector r7 to sector r8-1, less
+// one. a range that wrapped reads as a huge count and takes the wide path,
+// whose range check counts it. clobbers r2 and r3
+func emitCellSpan(a *bpfAsm, cs int32) {
+	a.emit(movReg(r2, r8))
+	a.emit(subImm(r2, 1))
+	a.emit(rshImm(r2, cs))
+	a.emit(movReg(r3, r7))
+	a.emit(rshImm(r3, cs))
+	a.emit(subReg(r2, r3))
+}
+
+// sets the cells of 1<<(cs+9) bytes from base on that the saved write
+// covers, at most trackFineUnroll of them, then ends at pexit
+func emitBankCells(a *bpfAsm, bank *trackBankProg, cs int32, base uint32) {
+	a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
+	a.emit(rshImm(r7, cs))
+	a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
+	a.emit(subImm(r8, 1))
+	a.emit(rshImm(r8, cs))
+	for i := 0; i < trackFineUnroll; i++ {
+		a.jump(bpfJGT|bpfSrcX, r7, r8, 0, "pexit")
+		emitBankCell(a, bank, r7, base, true, "poverflow")
+		a.emit(addImm(r7, 1))
+	}
+	a.jump(bpfJA, 0, 0, 0, "pexit")
+}
+
 // the plain write of a disk with banks: [r7, r7 + nr_bytes) in sectors, the
-// active counter up first, then the count, then the fine or ladder cells,
-// ending at its own p ends, which bring the counter down
+// active counter up first, then the count, then the fine, mid or ladder
+// cells, ending at its own p ends, which bring the counter down. a write of
+// at most trackFineUnroll fine cells sets them; on a bank with mid cells a
+// wider one of at most trackFineUnroll mid cells sets those, which are the
+// cells the disk kept before its banks went finer (#11091); any wider write
+// sets the ladder cells of what it counted
 func emitBankedWrite(a *bpfAsm, shift uint, regions uint32, bases []uint32, regionMapFD, statsMapFD int, bank *trackBankProg) {
 	emitActiveUp(a, bank, "overflow")
 	a.emit(ldx(bpfSizeDW, r4, r6, 16)) // r4 = nr_bytes completed, clobbered by the lookup
@@ -983,28 +1018,33 @@ func emitBankedWrite(a *bpfAsm, shift uint, regions uint32, bases []uint32, regi
 	a.emit(stx(bpfSizeDW, r10, r7, trackStartSlot))
 	a.emit(stx(bpfSizeDW, r10, r8, trackEndSlot))
 	fs := int32(bank.fshift - 9)
-	// fine cells last - first; a range that wrapped reads as a huge count and
-	// takes the wide path, whose range check counts it
-	a.emit(movReg(r2, r8))
-	a.emit(subImm(r2, 1))
-	a.emit(rshImm(r2, fs))
-	a.emit(movReg(r3, r7))
-	a.emit(rshImm(r3, fs))
-	a.emit(subReg(r2, r3))
-	a.jump(bpfJGT|bpfSrcK, r2, 0, trackFineUnroll-1, "pwide")
+	ms := int32(bank.mshift) - 9
+	emitCellSpan(a, fs)
+	if bank.mshift == 0 {
+		a.jump(bpfJGT|bpfSrcK, r2, 0, trackFineUnroll-1, "pwide")
+	} else {
+		a.jump(bpfJGT|bpfSrcK, r2, 0, trackFineUnroll-1, "pmidspan")
+		a.jump(bpfJA, 0, 0, 0, "pcount")
+		a.label("pmidspan")
+		emitCellSpan(a, ms)
+		a.jump(bpfJGT|bpfSrcK, r2, 0, trackFineUnroll-1, "pwide")
+		a.label("pcount")
+	}
 	emitTrackRange(a, "pn", shift, regions, bases, counterMarkWith(regionMapFD, bank.fetch), true, "poverflow", "pnfine")
 	a.label("pnfine")
-	a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
-	a.emit(rshImm(r7, fs))
-	a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
-	a.emit(subImm(r8, 1))
-	a.emit(rshImm(r8, fs))
-	for i := 0; i < trackFineUnroll; i++ {
-		a.jump(bpfJGT|bpfSrcX, r7, r8, 0, "pexit")
-		emitBankCell(a, bank, r7, 0, true, "poverflow")
-		a.emit(addImm(r7, 1))
+	if bank.mshift != 0 {
+		// the count clobbered r7 and r8: the span is taken again from the
+		// saved range
+		a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
+		a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
+		emitCellSpan(a, fs)
+		a.jump(bpfJGT|bpfSrcK, r2, 0, trackFineUnroll-1, "pnmid")
 	}
-	a.jump(bpfJA, 0, 0, 0, "pexit")
+	emitBankCells(a, bank, fs, 0)
+	if bank.mshift != 0 {
+		a.label("pnmid")
+		emitBankCells(a, bank, ms, bank.mid)
+	}
 	a.label("pwide")
 	a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
 	a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
