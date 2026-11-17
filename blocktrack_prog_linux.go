@@ -194,6 +194,15 @@ func atomicAddDW(fetch bool, dst, src uint8, off int16) bpfInsn {
 	return xaddDW(dst, src, off)
 }
 
+// r0 = *(u32 *)(dst + off), and src is stored there when that equals the
+// low word of r0, atomically (linux 5.12). the old value is zero-extended
+// into r0
+const bpfCmpxchg = 0xf0 | bpfFetch
+
+func cmpxchgW(dst, src uint8, off int16) bpfInsn {
+	return mkInsn(bpfClassSTX|bpfModeXADD|bpfSizeW, dst, src, off, bpfCmpxchg)
+}
+
 // *(size *)(dst + off) = imm
 func stImm(size, dst uint8, off int16, imm int32) bpfInsn {
 	return mkInsn(bpfClassST|bpfModeMEM|size, dst, 0, off, imm)
@@ -433,6 +442,9 @@ func buildTrackProgramBanks(l trackLayout, dev uint32, shift uint, regions uint3
 	}
 	if bank != nil && bank.mshift != 0 && (bank.mshift != trackBankFineShift(shift) || bank.mshift <= bank.fshift || bank.mshift >= shift || bank.mid > bank.ladder) {
 		return nil, fmt.Errorf("mid cell shift %d does not fit fine cells of shift %d in regions of shift %d", bank.mshift, bank.fshift, shift)
+	}
+	if bank != nil && bank.pages != 0 && (shift-bank.fshift < 4 || uint64(bank.cellsPer) != uint64(1)<<(shift-bank.fshift) || bank.mid != 0 || uint64(bank.pages)*2 >= 1<<31) {
+		return nil, fmt.Errorf("sparse pages of %d cells do not fit fine cells of shift %d in regions of shift %d", bank.cellsPer, bank.fshift, shift)
 	}
 	offs, err := trackProgramOffsets(l, dev, shift, regions)
 	if err != nil {
@@ -1040,16 +1052,148 @@ func emitBankedWrite(a *bpfAsm, shift uint, regions uint32, bases []uint32, regi
 		emitCellSpan(a, fs)
 		a.jump(bpfJGT|bpfSrcK, r2, 0, trackFineUnroll-1, "pnmid")
 	}
-	emitBankCells(a, bank, fs, 0)
+	if bank.pages == 0 {
+		emitBankCells(a, bank, fs, 0)
+	} else {
+		emitSparseCells(a, bank, shift)
+	}
 	if bank.mshift != 0 {
 		a.label("pnmid")
 		emitBankCells(a, bank, ms, bank.mid)
+	}
+	if bank.pages != 0 && bank.mshift == 0 {
+		// a full pool on a bank with no mid cells: the ladder cells of the
+		// regions the write counted, which it counted already
+		a.label("pfull")
+		a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
+		a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
+		emitTrackRange(a, "pf", shift, regions, bases, func(a *bpfAsm, overflow, next string) {
+			emitBankCell(a, bank, r7, bank.ladder, false, overflow)
+		}, true, "poverflow", "pexit")
 	}
 	a.label("pwide")
 	a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
 	a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
 	emitTrackRange(a, "pw", shift, regions, bases, ladderMark(regionMapFD, bank), true, "poverflow", "pexit")
 	emitTrackOverflow(a, "p", statsMapFD, bank)
+}
+
+// sets the fine cells of the saved write in each bank's sparse pages
+// (#11487), then ends at pexit. the write's fine cells are at most
+// trackFineUnroll and a page holds at least 16, so they lie in the write's
+// first region and, when it crosses into the next, that one: two segments
+// per bank, each one page. a region with no page in the bank yet takes the
+// next from the bank's allocator and installs it with a compare and
+// exchange from 0; a lost race uses the winner's page and leaves its own
+// number unused. a full pool sets the write's mid cells in both banks
+// instead (pnmid), or the ladder cells of its regions on a bank with no mid
+// cells (pfull), which read coarser, never fewer bytes. a missing map
+// element (unreachable, every key is in range) is an overflow. r9 holds the
+// index entry and then the page across the helper calls
+func emitSparseCells(a *bpfAsm, bank *trackBankProg, shift uint) {
+	fs := int32(bank.fshift - 9)
+	k := int32(shift - bank.fshift)
+	full := "pfull"
+	if bank.mshift != 0 {
+		full = "pnmid"
+	}
+	for b := 0; b < 2; b++ {
+		for seg := 0; seg < 2; seg++ {
+			p := fmt.Sprintf("ps%d%d", b, seg)
+			// r7 = the segment's first fine cell, r8 its last, r1 its region
+			a.emit(ldx(bpfSizeDW, r7, r10, trackStartSlot))
+			a.emit(rshImm(r7, fs))
+			a.emit(ldx(bpfSizeDW, r8, r10, trackEndSlot))
+			a.emit(subImm(r8, 1))
+			a.emit(rshImm(r8, fs))
+			if seg == 0 {
+				a.emit(movReg(r1, r7))
+				a.emit(rshImm(r1, k))
+				a.emit(movReg(r2, r1))
+				a.emit(addImm(r2, 1))
+				a.emit(lshImm(r2, k))
+				a.emit(subImm(r2, 1))
+				a.jump(bpfJGT|bpfSrcX, r8, r2, 0, p+"clip")
+				a.jump(bpfJA, 0, 0, 0, p+"go")
+				a.label(p + "clip")
+				a.emit(movReg(r8, r2))
+				a.label(p + "go")
+			} else {
+				a.emit(movReg(r1, r8))
+				a.emit(rshImm(r1, k))
+				a.emit(movReg(r2, r7))
+				a.emit(rshImm(r2, k))
+				a.jump(bpfJEQ|bpfSrcX, r1, r2, 0, p+"done")
+				a.emit(movReg(r7, r1))
+				a.emit(lshImm(r7, k))
+			}
+			emitSparsePage(a, bank, b, p, full)
+			mask := int32(bank.cellsPer - 1)
+			for i := 0; i < trackFineUnroll; i++ {
+				set := fmt.Sprintf("%sset%d", p, i)
+				a.jump(bpfJGT|bpfSrcX, r7, r8, 0, p+"done")
+				a.emit(movReg(r1, r7))
+				a.emit(andImm(r1, mask))
+				a.emit(movReg(r2, r9))
+				a.emit(addReg(r2, r1))
+				a.emit(ldx(bpfSizeB, r3, r2, 0))
+				a.jump(bpfJNE|bpfSrcK, r3, 0, 0, set)
+				a.emit(stImm(bpfSizeB, r2, 0, 1))
+				a.label(set)
+				a.emit(addImm(r7, 1))
+			}
+			a.label(p + "done")
+		}
+	}
+	a.jump(bpfJA, 0, 0, 0, "pexit")
+}
+
+// r9 = the page of region r1 in bank b, given from the allocator when the
+// region has none; a full pool jumps to full. clobbers r0-r5. r7 and r8
+// survive the helper calls
+func emitSparsePage(a *bpfAsm, bank *trackBankProg, b int, p, full string) {
+	a.emit(stx(bpfSizeW, r10, r1, -4))
+	m := ldMapFD(r1, bank.indexFD)
+	a.emit(m[0], m[1])
+	a.emit(movReg(r2, r10))
+	a.emit(addImm(r2, -4))
+	a.emit(callHelper(bpfFuncMapLookupElem))
+	a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, "poverflow")
+	a.emit(movReg(r9, r0))
+	a.emit(ldx(bpfSizeW, r1, r9, int16(4*b)))
+	a.jump(bpfJNE|bpfSrcK, r1, 0, 0, p+"have")
+	a.emit(stImm(bpfSizeW, r10, -4, int32(b)))
+	m = ldMapFD(r1, bank.allocFD)
+	a.emit(m[0], m[1])
+	a.emit(movReg(r2, r10))
+	a.emit(addImm(r2, -4))
+	a.emit(callHelper(bpfFuncMapLookupElem))
+	a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, "poverflow")
+	// a full pool stays full until the next clear, so a plain load sends
+	// every later write to the fallback without a contended atomic; a write
+	// that reads room re-checks the number its fetch add hands out
+	a.emit(ldx(bpfSizeDW, r1, r0, 0))
+	a.jump(bpfJGT|bpfSrcK, r1, 0, int32(bank.pages-1), full)
+	a.emit(movImm(r1, 1))
+	a.emit(atomicAddDW(true, r0, r1, 0))
+	a.jump(bpfJGT|bpfSrcK, r1, 0, int32(bank.pages-1), full)
+	a.emit(addImm(r1, 1))
+	a.emit(movImm(r0, 0))
+	a.emit(cmpxchgW(r9, r1, int16(4*b)))
+	a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, p+"have")
+	a.emit(movReg(r1, r0))
+	a.label(p + "have")
+	// the page's key: bank b's pages start at b*pages, and the entry is
+	// the page number plus one
+	a.emit(addImm(r1, int32(uint32(b)*bank.pages)-1))
+	a.emit(stx(bpfSizeW, r10, r1, -4))
+	m = ldMapFD(r1, bank.poolFD)
+	a.emit(m[0], m[1])
+	a.emit(movReg(r2, r10))
+	a.emit(addImm(r2, -4))
+	a.emit(callHelper(bpfFuncMapLookupElem))
+	a.jump(bpfJEQ|bpfSrcK, r0, 0, 0, "poverflow")
+	a.emit(movReg(r9, r0))
 }
 
 // the kernel 5.4 mode (trackLayout.classic). before 5.5 a raw tracepoint
