@@ -646,8 +646,9 @@ func emitTrackFold(a *bpfAsm, offs map[string]int16, shift uint, regions uint32,
 // queue with no disk jumps to nodisk. on the disk's queue the disk's
 // passPolicy decides (passFor): an sd disk's DRV_IN and SCSI_IN go to the
 // command check, virtio_blk's DRV_IN leaves, and everything else counts. on
-// a queue with no disk only a proven nvme admin query leaves. nothing leaves
-// by the bytes it moved. the request is reloaded from the context, since
+// a queue with no disk an sd disk leaves (that queue is another scsi
+// device's) and otherwise only a proven nvme admin query leaves. nothing
+// leaves by the bytes it moved. the request is reloaded from the context, since
 // r1-r5 are the helper calls' arguments
 func emitTrackPassthrough(a *bpfAsm, l trackLayout, qOff int16) {
 	pass := l.passFor()
@@ -663,10 +664,20 @@ func emitTrackPassthrough(a *bpfAsm, l trackLayout, qOff int16) {
 	}
 	a.jump(bpfJA, 0, 0, 0, "overflow")
 	a.label("nodisk")
-	if l.nvme.usable() {
-		emitNVMeAdminPass(a, l.nvme, qOff, ldx(bpfSizeDW, r7, r6, 0))
+	if l.pass == passSD {
+		// a scsi disk's commands travel on its own queue alone, so a queue
+		// with no disk is another scsi device's: a bus scan's probe of an
+		// empty target id, a tape or an enclosure. nothing there changed
+		// this disk (a rescan after a hot-add read every disk in full).
+		// nothing else is emitted here: the verifier refuses code it
+		// cannot reach
+		a.jump(bpfJA, 0, 0, 0, "exit")
+	} else {
+		if l.nvme.usable() {
+			emitNVMeAdminPass(a, l.nvme, qOff, ldx(bpfSizeDW, r7, r6, 0))
+		}
+		a.jump(bpfJA, 0, 0, 0, "overflow")
 	}
-	a.jump(bpfJA, 0, 0, 0, "overflow")
 	if pass == passSD {
 		emitSCSIRules(a, l.scsi, ldx(bpfSizeDW, r7, r6, 0), ldx(bpfSizeDW, r7, r6, 16))
 		a.jump(bpfJA, 0, 0, 0, "overflow")

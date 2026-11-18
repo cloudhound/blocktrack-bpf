@@ -351,7 +351,7 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift, foldShift uint, regi
 	// disk it names. a queue with no disk (an nvme controller's admin queue,
 	// which carries format and sanitize) can still change this disk's data,
 	// so anything but a read or a proven nvme admin query there moves the
-	// witness
+	// witness, except on an sd disk, whose commands never leave its own queue
 	emitDiskMatch(a, l.trackLayout, offs, r6, dev, otherDisk(l.trackLayout), "nodisk")
 	a.emit(ldx(bpfSizeW, r3, r6, offs["cmd_flags"]))
 	a.emit(andImm(r3, reqOpMask))
@@ -477,18 +477,29 @@ func buildMarkIssueProgram(l markLayout, dev uint32, shift, foldShift uint, regi
 	emitMarkFold(a, foldShift, foldMapFD, statsMapFD, "exit")
 
 	a.label("nodisk")
-	a.emit(ldx(bpfSizeW, r3, r6, offs["cmd_flags"]))
-	a.emit(andImm(r3, reqOpMask))
-	for _, op := range l.readOps {
-		a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "exit")
+	if l.pass == passSD {
+		// a scsi disk's commands travel on its own queue alone, so a queue
+		// with no disk is another scsi device's: a bus scan's probe of an
+		// empty target id, a tape or an enclosure. nothing there changed
+		// this disk (a rescan after a hot-add read every disk in full).
+		// nothing else is emitted here: the verifier refuses code it
+		// cannot reach
+		a.jump(bpfJA, 0, 0, 0, "exit")
+	} else {
+		a.emit(ldx(bpfSizeW, r3, r6, offs["cmd_flags"]))
+		a.emit(andImm(r3, reqOpMask))
+		for _, op := range l.readOps {
+			a.jump(bpfJEQ|bpfSrcK, r3, 0, op, "exit")
+		}
+		// an nvme controller's queries (hwmon threshold reads, smart and
+		// identify from monitoring tools) leave too. the check uses the
+		// stack slots the write path does, which nothing on this path has
+		// written
+		if l.nvme.usable() {
+			emitNVMeAdminPass(a, l.nvme, offs["q"], movReg(r7, r6))
+		}
+		emitStat(a, statsMapFD, markStatPassthrough, "exit")
 	}
-	// an nvme controller's queries (hwmon threshold reads, smart and identify
-	// from monitoring tools) leave too. the check uses the stack slots the
-	// write path does, which nothing on this path has written
-	if l.nvme.usable() {
-		emitNVMeAdminPass(a, l.nvme, offs["q"], movReg(r7, r6))
-	}
-	emitStat(a, statsMapFD, markStatPassthrough, "exit")
 
 	// a passthrough on another nvme namespace's queue naming this one. the
 	// command is set when the request is allocated, before it is issued
